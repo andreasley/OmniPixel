@@ -1,9 +1,9 @@
 import Foundation
 
 // The encoding half of JPEGCodec: baseline 4:4:4 YCbCr with the standard
-// Annex K quantization and Huffman tables, at a fixed quality of 85.
+// Annex K quantization and Huffman tables. Quality comes from
+// EncodingOptions.jpegQuality (1...100, default 85).
 extension JPEGCodec {
-    private static let encodingQuality = 85
 
     // MARK: Standard tables (ITU T.81 Annex K)
 
@@ -64,21 +64,26 @@ extension JPEGCodec {
         0xF9, 0xFA,
     ]
 
-    /// libjpeg's quality curve for qualities of 50 and above.
-    private static func scaledTable(_ base: [Int]) -> [Int] {
-        let scale = 200 - 2 * encodingQuality
+    /// libjpeg's quality curve: linear above 50, hyperbolic below.
+    private static func scaledTable(_ base: [Int], quality: Int) -> [Int] {
+        let scale = quality < 50 ? 5000 / quality : 200 - 2 * quality
         return base.map { min(255, max(1, ($0 * scale + 50) / 100)) }
     }
 
     // MARK: Encoding
 
     static func encode(_ image: Image) throws -> Data {
+        try encode(image, options: EncodingOptions())
+    }
+
+    static func encode(_ image: Image, options: EncodingOptions) throws -> Data {
         guard image.width <= 65535, image.height <= 65535 else {
             throw ImageError.invalidDimensions
         }
 
-        let luminanceQuantization = scaledTable(baseLuminanceQuantization)
-        let chrominanceQuantization = scaledTable(baseChrominanceQuantization)
+        let quality = min(100, max(1, options.jpegQuality))
+        let luminanceQuantization = scaledTable(baseLuminanceQuantization, quality: quality)
+        let chrominanceQuantization = scaledTable(baseChrominanceQuantization, quality: quality)
 
         // Convert to level-shifted YCbCr planes padded to multiples of eight
         // by edge replication (alpha is discarded).
@@ -226,7 +231,9 @@ extension JPEGCodec {
 
         var quantized = [Int](repeating: 0, count: 64)
         for i in 0..<64 {
-            quantized[i] = Int((frequency[i] / Double(quantization[i])).rounded())
+            // The clamp keeps AC magnitudes within the 10 bits the standard
+            // Huffman tables can express (only reachable near quality 100).
+            quantized[i] = min(1023, max(-1023, Int((frequency[i] / Double(quantization[i])).rounded())))
         }
 
         // DC coefficient, coded as the difference from the previous block.

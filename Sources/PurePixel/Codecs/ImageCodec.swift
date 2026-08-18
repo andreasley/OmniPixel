@@ -42,12 +42,32 @@ public enum ImageFormat: String, CaseIterable, Sendable {
     }
 }
 
+/// Options for encoding. Each field applies only to the formats that use it;
+/// the others ignore it.
+public struct EncodingOptions: Sendable {
+    /// JPEG quality from 1 (smallest file) to 100 (highest fidelity).
+    /// Values outside that range are clamped.
+    public var jpegQuality: Int
+
+    public init(jpegQuality: Int = 85) {
+        self.jpegQuality = jpegQuality
+    }
+}
+
 /// Reads and writes one image file format.
 protocol ImageCodec {
     /// Cheap magic-byte check; must not fully parse the data.
     static func canDecode(_ data: Data) -> Bool
     static func decode(_ data: Data) throws -> Image
     static func encode(_ image: Image) throws -> Data
+    /// Codecs with encoding parameters implement this; the default ignores options.
+    static func encode(_ image: Image, options: EncodingOptions) throws -> Data
+}
+
+extension ImageCodec {
+    static func encode(_ image: Image, options: EncodingOptions) throws -> Data {
+        try encode(image)
+    }
 }
 
 extension Image {
@@ -65,7 +85,7 @@ extension Image {
     }
 
     /// Encodes the image in the given format.
-    public func encoded(as format: ImageFormat) throws -> Data {
-        try format.codec.encode(self)
+    public func encoded(as format: ImageFormat, options: EncodingOptions = EncodingOptions()) throws -> Data {
+        try format.codec.encode(self, options: options)
     }
 }

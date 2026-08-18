@@ -290,7 +290,69 @@ import UniformTypeIdentifiers
         #expect(maximumChannelError(original, decoded) <= 16)
     }
 
+    @Test func jpegQualityOptionControlsSizeAndFidelity() throws {
+        let original = makeSmoothTestImage()
+        let low = try original.encoded(as: .jpeg, options: EncodingOptions(jpegQuality: 20))
+        let high = try original.encoded(as: .jpeg, options: EncodingOptions(jpegQuality: 95))
+        #expect(low.count < high.count)
+
+        let lowError = maximumChannelError(original, try Image(data: low))
+        let highError = maximumChannelError(original, try Image(data: high))
+        #expect(highError <= lowError)
+        #expect(highError <= 8)
+    }
+
     #if canImport(ImageIO)
+    @Test func decodesProgressiveJPEG() throws {
+        // ImageIO writes a real multi-scan progressive JPEG (SOF2 with
+        // spectral selection and successive approximation) when asked.
+        let original = makeSmoothTestImage(width: 40, height: 28)
+        var pixelData = [UInt8](repeating: 0, count: original.width * original.height * 4)
+        for y in 0..<original.height {
+            for x in 0..<original.width {
+                let pixel = original[x, y]
+                let i = (y * original.width + x) * 4
+                pixelData[i] = pixel.red
+                pixelData[i + 1] = pixel.green
+                pixelData[i + 2] = pixel.blue
+                pixelData[i + 3] = 255
+            }
+        }
+        let context = try #require(CGContext(
+            data: &pixelData,
+            width: original.width,
+            height: original.height,
+            bitsPerComponent: 8,
+            bytesPerRow: original.width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let cgImage = try #require(context.makeImage())
+
+        let progressiveData = NSMutableData()
+        let destination = try #require(CGImageDestinationCreateWithData(
+            progressiveData, UTType.jpeg.identifier as CFString, 1, nil
+        ))
+        CGImageDestinationAddImage(destination, cgImage, [
+            kCGImagePropertyJFIFDictionary: [kCGImagePropertyJFIFIsProgressive: true],
+            kCGImageDestinationLossyCompressionQuality: 0.9,
+        ] as CFDictionary)
+        #expect(CGImageDestinationFinalize(destination))
+
+        // Make sure ImageIO actually produced a progressive file (SOF2).
+        let bytes = [UInt8](progressiveData as Data)
+        var sawProgressiveFrame = false
+        for i in 0..<(bytes.count - 1) where bytes[i] == 0xFF && bytes[i + 1] == 0xC2 {
+            sawProgressiveFrame = true
+        }
+        #expect(sawProgressiveFrame)
+
+        let decoded = try Image(data: progressiveData as Data)
+        #expect(decoded.width == original.width)
+        #expect(decoded.height == original.height)
+        #expect(maximumChannelError(original, decoded) <= 32)
+    }
+
     @Test func jpegInteroperatesWithImageIO() throws {
         let original = makeSmoothTestImage()
 
