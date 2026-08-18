@@ -2,6 +2,12 @@ import Foundation
 import Testing
 @testable import PurePixel
 
+#if canImport(ImageIO)
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
+#endif
+
 @Suite struct CodecTests {
     /// A small image with gradients, varied alpha and a flat run,
     /// to exercise all the QOI ops and PNG value ranges.
@@ -18,6 +24,30 @@ import Testing
                         blue: UInt8((x + y) * 7 % 256),
                         alpha: UInt8(255 - (x * y) % 128)
                     )
+                }
+            }
+        }
+        return image
+    }
+
+    /// Few distinct colors and hard (0/255) alpha — content GIF stores exactly.
+    private func makePalettedTestImage() -> Image {
+        let colors: [RGBA] = [
+            .black,
+            RGBA(red: 255, green: 0, blue: 0),
+            RGBA(red: 0, green: 255, blue: 0),
+            RGBA(red: 0, green: 0, blue: 255),
+            RGBA(red: 255, green: 255, blue: 0),
+            RGBA(red: 12, green: 34, blue: 56),
+            .white,
+        ]
+        var image = Image(width: 40, height: 25)
+        for y in 0..<image.height {
+            for x in 0..<image.width {
+                if (x + y) % 5 == 0 {
+                    image[x, y] = .transparent
+                } else {
+                    image[x, y] = colors[(x * 3 + y) % colors.count]
                 }
             }
         }
@@ -58,8 +88,10 @@ import Testing
         #expect(try Image(data: pngData) == original)
     }
 
+    // MARK: PNG
+
     @Test func pngRoundTripOfLargerImage() throws {
-        // Big enough that the encoder emits real LZ77 matches, a dynamic
+        // Big enough that the encoder emits real LZW matches, a dynamic
         // Huffman block and varied per-row filters, exercising the full
         // compression path (and all the decoder's unfilter paths) end to end.
         var image = Image(width: 200, height: 150)
@@ -185,29 +217,6 @@ import Testing
         }
     }
 
-    @Test func decodingGarbageFails() {
-        #expect(throws: ImageError.unknownFormat) {
-            _ = try Image(data: Data([0x00, 0x01, 0x02, 0x03, 0x04]))
-        }
-    }
-
-    @Test func decodingTruncatedPNGFails() throws {
-        let encoded = try makeTestImage().encoded(as: .png)
-        #expect(throws: ImageError.self) {
-            _ = try Image(data: encoded.prefix(encoded.count / 2))
-        }
-    }
-
-    @Test func decodesGrayscalePGM() throws {
-        let header = Array("P5\n# a comment\n3 2\n255\n".utf8)
-        let samples: [UInt8] = [0, 128, 255, 10, 20, 30]
-        let image = try Image(data: Data(header + samples))
-        #expect(image.width == 3)
-        #expect(image.height == 2)
-        #expect(image[1, 0] == RGBA(red: 128, green: 128, blue: 128))
-        #expect(image[2, 1] == RGBA(red: 30, green: 30, blue: 30))
-    }
-
     @Test func decodesPalettePNGWithSubByteDepth() throws {
         // Hand-built 4×2 PNG, 2-bit palette. Rows: indices 0 1 2 3 and 3 2 1 0,
         // packed most-significant-bits-first, each row prefixed with filter type 0.
@@ -232,6 +241,163 @@ import Testing
         #expect(image[3, 0] == .white)
         #expect(image[0, 1] == .white)
         #expect(image[3, 1] == RGBA(red: 255, green: 0, blue: 0))
+    }
+
+    // MARK: GIF
+
+    @Test func gifRoundTripOfPalettedImage() throws {
+        let original = makePalettedTestImage()
+        let encoded = try original.encoded(as: .gif)
+        #expect(ImageFormat(detecting: encoded) == .gif)
+        #expect(try Image(data: encoded) == original)
+    }
+
+    @Test func gifQuantizesRichImages() throws {
+        // Thousands of unique colors force median-cut quantization; the round
+        // trip is lossy but colors should stay close.
+        var image = Image(width: 64, height: 64)
+        for y in 0..<image.height {
+            for x in 0..<image.width {
+                image[x, y] = RGBA(red: UInt8(x * 4), green: UInt8(y * 4), blue: UInt8((x + y) * 2))
+            }
+        }
+        let decoded = try Image(data: image.encoded(as: .gif))
+        #expect(decoded.width == 64)
+        #expect(decoded.height == 64)
+        #expect(decoded.pixels.allSatisfy { $0.alpha == 255 })
+
+        var maximumError = 0
+        for (expected, actual) in zip(image.pixels, decoded.pixels) {
+            maximumError = max(maximumError, abs(Int(expected.red) - Int(actual.red)))
+            maximumError = max(maximumError, abs(Int(expected.green) - Int(actual.green)))
+            maximumError = max(maximumError, abs(Int(expected.blue) - Int(actual.blue)))
+        }
+        #expect(maximumError <= 64)
+    }
+
+    @Test func decodesInterlacedGIF() throws {
+        // Hand-built 3×5 interlaced GIF. Row y is filled with palette index y;
+        // interlacing stores the rows in the order 0, 4, 2, 1, 3.
+        var writer = ByteWriter()
+        writer.writeBytes(Array("GIF89a".utf8))
+        writer.writeUInt16LittleEndian(3)
+        writer.writeUInt16LittleEndian(5)
+        writer.writeByte(0x80 | 0x02)  // global color table, 8 entries
+        writer.writeByte(0)
+        writer.writeByte(0)
+        for i in 0..<8 {
+            let value = UInt8(i * 30)
+            writer.writeBytes([value, value, value])
+        }
+        writer.writeByte(0x2C)  // image descriptor
+        writer.writeUInt16LittleEndian(0)
+        writer.writeUInt16LittleEndian(0)
+        writer.writeUInt16LittleEndian(3)
+        writer.writeUInt16LittleEndian(5)
+        writer.writeByte(0x40)  // interlaced, no local table
+
+        let storedIndices = [0, 0, 0, 4, 4, 4, 2, 2, 2, 1, 1, 1, 3, 3, 3]
+        let compressed = GIFLZW.compress(storedIndices, minimumCodeSize: 3)
+        writer.writeByte(3)  // LZW minimum code size
+        writer.writeByte(UInt8(compressed.count))
+        writer.writeBytes(compressed)
+        writer.writeByte(0)  // sub-block terminator
+        writer.writeByte(0x3B)  // trailer
+
+        let image = try Image(data: writer.data)
+        for y in 0..<5 {
+            let value = UInt8(y * 30)
+            for x in 0..<3 {
+                #expect(image[x, y] == RGBA(red: value, green: value, blue: value), "pixel (\(x), \(y))")
+            }
+        }
+    }
+
+    #if canImport(ImageIO)
+    @Test func gifInteroperatesWithImageIO() throws {
+        let original = makePalettedTestImage()
+        let encoded = try original.encoded(as: .gif)
+
+        // Our encoder → Apple's decoder.
+        let source = try #require(CGImageSourceCreateWithData(encoded as CFData, nil))
+        let cgImage = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        #expect(cgImage.width == original.width)
+        #expect(cgImage.height == original.height)
+
+        var pixelData = [UInt8](repeating: 0, count: original.width * original.height * 4)
+        let context = try #require(CGContext(
+            data: &pixelData,
+            width: original.width,
+            height: original.height,
+            bitsPerComponent: 8,
+            bytesPerRow: original.width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: original.width, height: original.height))
+
+        var appleDecodeMismatches = 0
+        for y in 0..<original.height {
+            for x in 0..<original.width {
+                let expected = original[x, y]
+                let i = (y * original.width + x) * 4
+                if pixelData[i] != expected.red || pixelData[i + 1] != expected.green
+                    || pixelData[i + 2] != expected.blue || pixelData[i + 3] != expected.alpha {
+                    appleDecodeMismatches += 1
+                }
+            }
+        }
+        #expect(appleDecodeMismatches == 0)
+
+        // Apple's encoder → our decoder. ImageIO may requantize, so compare
+        // transparency exactly and colors only for opaque pixels.
+        let appleData = NSMutableData()
+        let destination = try #require(CGImageDestinationCreateWithData(
+            appleData, UTType.gif.identifier as CFString, 1, nil
+        ))
+        CGImageDestinationAddImage(destination, cgImage, nil)
+        #expect(CGImageDestinationFinalize(destination))
+
+        let redecoded = try Image(data: appleData as Data)
+        #expect(redecoded.width == original.width)
+        #expect(redecoded.height == original.height)
+        var ourDecodeMismatches = 0
+        for (expected, actual) in zip(original.pixels, redecoded.pixels) {
+            let expectedTransparent = expected.alpha == 0
+            let actualTransparent = actual.alpha == 0
+            if expectedTransparent != actualTransparent {
+                ourDecodeMismatches += 1
+            } else if !expectedTransparent && expected != actual {
+                ourDecodeMismatches += 1
+            }
+        }
+        #expect(ourDecodeMismatches == 0)
+    }
+    #endif
+
+    // MARK: Other formats
+
+    @Test func decodingGarbageFails() {
+        #expect(throws: ImageError.unknownFormat) {
+            _ = try Image(data: Data([0x00, 0x01, 0x02, 0x03, 0x04]))
+        }
+    }
+
+    @Test func decodingTruncatedPNGFails() throws {
+        let encoded = try makeTestImage().encoded(as: .png)
+        #expect(throws: ImageError.self) {
+            _ = try Image(data: encoded.prefix(encoded.count / 2))
+        }
+    }
+
+    @Test func decodesGrayscalePGM() throws {
+        let header = Array("P5\n# a comment\n3 2\n255\n".utf8)
+        let samples: [UInt8] = [0, 128, 255, 10, 20, 30]
+        let image = try Image(data: Data(header + samples))
+        #expect(image.width == 3)
+        #expect(image.height == 2)
+        #expect(image[1, 0] == RGBA(red: 128, green: 128, blue: 128))
+        #expect(image[2, 1] == RGBA(red: 30, green: 30, blue: 30))
     }
 
     @Test func decodes32BitBMPTreatingZeroAlphaAsOpaque() throws {

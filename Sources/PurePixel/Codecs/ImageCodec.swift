@@ -3,6 +3,7 @@ import Foundation
 /// A file format PurePixel can read and write.
 public enum ImageFormat: String, CaseIterable, Sendable {
     case png
+    case gif
     case bmp
     case qoi
     /// Netpbm binary formats (PPM/PGM).
@@ -12,6 +13,7 @@ public enum ImageFormat: String, CaseIterable, Sendable {
     public var fileExtension: String {
         switch self {
         case .png: "png"
+        case .gif: "gif"
         case .bmp: "bmp"
         case .qoi: "qoi"
         case .netpbm: "ppm"
@@ -29,6 +31,7 @@ public enum ImageFormat: String, CaseIterable, Sendable {
     var codec: any ImageCodec.Type {
         switch self {
         case .png: PNGCodec.self
+        case .gif: GIFCodec.self
         case .bmp: BMPCodec.self
         case .qoi: QOICodec.self
         case .netpbm: NetpbmCodec.self
