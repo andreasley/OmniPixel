@@ -21,6 +21,11 @@ struct ByteWriter {
         bytes.append(UInt8(truncatingIfNeeded: value >> 8))
     }
 
+    mutating func writeUInt16BigEndian(_ value: UInt16) {
+        bytes.append(UInt8(truncatingIfNeeded: value >> 8))
+        bytes.append(UInt8(truncatingIfNeeded: value))
+    }
+
     mutating func writeUInt32LittleEndian(_ value: UInt32) {
         bytes.append(UInt8(truncatingIfNeeded: value))
         bytes.append(UInt8(truncatingIfNeeded: value >> 8))

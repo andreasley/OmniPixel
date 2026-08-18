@@ -54,6 +54,21 @@ import UniformTypeIdentifiers
         return image
     }
 
+    /// Smooth opaque gradients — content JPEG reproduces closely.
+    private func makeSmoothTestImage(width: Int = 64, height: Int = 48) -> Image {
+        var image = Image(width: width, height: height)
+        for y in 0..<height {
+            for x in 0..<width {
+                image[x, y] = RGBA(
+                    red: UInt8(min(255, x * 3)),
+                    green: UInt8(min(255, y * 4)),
+                    blue: UInt8(min(255, 60 + x + y))
+                )
+            }
+        }
+        return image
+    }
+
     private func opaque(_ image: Image) -> Image {
         var result = image
         for y in 0..<result.height {
@@ -62,6 +77,16 @@ import UniformTypeIdentifiers
             }
         }
         return result
+    }
+
+    private func maximumChannelError(_ first: Image, _ second: Image) -> Int {
+        var maximum = 0
+        for (a, b) in zip(first.pixels, second.pixels) {
+            maximum = max(maximum, abs(Int(a.red) - Int(b.red)))
+            maximum = max(maximum, abs(Int(a.green) - Int(b.green)))
+            maximum = max(maximum, abs(Int(a.blue) - Int(b.blue)))
+        }
+        return maximum
     }
 
     @Test(arguments: [ImageFormat.png, .qoi])
@@ -243,6 +268,122 @@ import UniformTypeIdentifiers
         #expect(image[3, 1] == RGBA(red: 255, green: 0, blue: 0))
     }
 
+    // MARK: JPEG
+
+    @Test func jpegRoundTripIsCloseToOriginal() throws {
+        let original = makeSmoothTestImage()
+        let encoded = try original.encoded(as: .jpeg)
+        #expect(ImageFormat(detecting: encoded) == .jpeg)
+
+        let decoded = try Image(data: encoded)
+        #expect(decoded.width == original.width)
+        #expect(decoded.height == original.height)
+        #expect(decoded.pixels.allSatisfy { $0.alpha == 255 })
+        #expect(maximumChannelError(original, decoded) <= 16)
+    }
+
+    @Test func jpegHandlesDimensionsThatAreNotMultiplesOfEight() throws {
+        let original = makeSmoothTestImage(width: 13, height: 9)
+        let decoded = try Image(data: original.encoded(as: .jpeg))
+        #expect(decoded.width == 13)
+        #expect(decoded.height == 9)
+        #expect(maximumChannelError(original, decoded) <= 16)
+    }
+
+    #if canImport(ImageIO)
+    @Test func jpegInteroperatesWithImageIO() throws {
+        let original = makeSmoothTestImage()
+
+        // Our encoder → Apple's decoder.
+        let encoded = try original.encoded(as: .jpeg)
+        let source = try #require(CGImageSourceCreateWithData(encoded as CFData, nil))
+        let cgImage = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        #expect(cgImage.width == original.width)
+        #expect(cgImage.height == original.height)
+
+        var pixelData = [UInt8](repeating: 0, count: original.width * original.height * 4)
+        let context = try #require(CGContext(
+            data: &pixelData,
+            width: original.width,
+            height: original.height,
+            bitsPerComponent: 8,
+            bytesPerRow: original.width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: original.width, height: original.height))
+
+        var appleDecoded = Image(width: original.width, height: original.height)
+        for y in 0..<original.height {
+            for x in 0..<original.width {
+                let i = (y * original.width + x) * 4
+                appleDecoded[x, y] = RGBA(red: pixelData[i], green: pixelData[i + 1], blue: pixelData[i + 2])
+            }
+        }
+        #expect(maximumChannelError(original, appleDecoded) <= 24)
+
+        // Apple's encoder → our decoder (typically exercises chroma subsampling).
+        let appleData = NSMutableData()
+        let destination = try #require(CGImageDestinationCreateWithData(
+            appleData, UTType.jpeg.identifier as CFString, 1, nil
+        ))
+        let sourceImage = try #require(context.makeImage())  // context still holds Apple's decode of our file
+        CGImageDestinationAddImage(destination, sourceImage, [
+            kCGImageDestinationLossyCompressionQuality: 0.9,
+        ] as CFDictionary)
+        #expect(CGImageDestinationFinalize(destination))
+
+        let redecoded = try Image(data: appleData as Data)
+        #expect(redecoded.width == original.width)
+        #expect(redecoded.height == original.height)
+        #expect(maximumChannelError(original, redecoded) <= 32)
+    }
+
+    @Test func decodesGrayscaleJPEGFromImageIO() throws {
+        let width = 32
+        let height = 16
+        var grayData = [UInt8](repeating: 0, count: width * height)
+        for y in 0..<height {
+            for x in 0..<width {
+                grayData[y * width + x] = UInt8(min(255, x * 6 + y * 4))
+            }
+        }
+        let context = try #require(CGContext(
+            data: &grayData,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ))
+        let cgImage = try #require(context.makeImage())
+
+        let jpegData = NSMutableData()
+        let destination = try #require(CGImageDestinationCreateWithData(
+            jpegData, UTType.jpeg.identifier as CFString, 1, nil
+        ))
+        CGImageDestinationAddImage(destination, cgImage, [
+            kCGImageDestinationLossyCompressionQuality: 0.95,
+        ] as CFDictionary)
+        #expect(CGImageDestinationFinalize(destination))
+
+        let decoded = try Image(data: jpegData as Data)
+        #expect(decoded.width == width)
+        #expect(decoded.height == height)
+        var maximumError = 0
+        for y in 0..<height {
+            for x in 0..<width {
+                let pixel = decoded[x, y]
+                #expect(pixel.red == pixel.green)
+                #expect(pixel.green == pixel.blue)
+                maximumError = max(maximumError, abs(Int(pixel.red) - Int(grayData[y * width + x])))
+            }
+        }
+        #expect(maximumError <= 16)
+    }
+    #endif
+
     // MARK: GIF
 
     @Test func gifRoundTripOfPalettedImage() throws {
@@ -265,14 +406,7 @@ import UniformTypeIdentifiers
         #expect(decoded.width == 64)
         #expect(decoded.height == 64)
         #expect(decoded.pixels.allSatisfy { $0.alpha == 255 })
-
-        var maximumError = 0
-        for (expected, actual) in zip(image.pixels, decoded.pixels) {
-            maximumError = max(maximumError, abs(Int(expected.red) - Int(actual.red)))
-            maximumError = max(maximumError, abs(Int(expected.green) - Int(actual.green)))
-            maximumError = max(maximumError, abs(Int(expected.blue) - Int(actual.blue)))
-        }
-        #expect(maximumError <= 64)
+        #expect(maximumChannelError(image, decoded) <= 64)
     }
 
     @Test func decodesInterlacedGIF() throws {
