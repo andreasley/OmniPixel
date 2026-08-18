@@ -7,6 +7,9 @@ public enum ImageFormat: String, CaseIterable, Sendable {
     case gif
     case tiff
     case webp
+    /// Recognized and parsed, but decoding requires an HEVC decoder,
+    /// which is not implemented; `decode` throws `unsupportedFeature`.
+    case heic
     case bmp
     case qoi
     /// Netpbm binary formats (PPM/PGM).
@@ -20,6 +23,7 @@ public enum ImageFormat: String, CaseIterable, Sendable {
         case .gif: "gif"
         case .tiff: "tiff"
         case .webp: "webp"
+        case .heic: "heic"
         case .bmp: "bmp"
         case .qoi: "qoi"
         case .netpbm: "ppm"
@@ -41,6 +45,7 @@ public enum ImageFormat: String, CaseIterable, Sendable {
         case .gif: GIFCodec.self
         case .tiff: TIFFCodec.self
         case .webp: WebPCodec.self
+        case .heic: HEICCodec.self
         case .bmp: BMPCodec.self
         case .qoi: QOICodec.self
         case .netpbm: NetpbmCodec.self

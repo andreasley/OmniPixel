@@ -900,6 +900,82 @@ import UniformTypeIdentifiers
         #expect(image[1, 1] == RGBA(red: 3, green: 19, blue: 6))    // mode 7: Average2(L, T)
     }
 
+    // MARK: HEIC
+
+    @Test func heicIsRecognizedButReportsMissingHEVCDecoder() throws {
+        // Hand-built minimal HEIF: an ftyp box with the heic brand and a
+        // meta/iprp/ipco/ispe chain declaring 100×50 pixels.
+        var writer = ByteWriter()
+        writer.writeUInt32BigEndian(20)  // ftyp box
+        writer.writeBytes(Array("ftypheic".utf8))
+        writer.writeUInt32BigEndian(0)  // minor version
+        writer.writeBytes(Array("mif1".utf8))
+        writer.writeUInt32BigEndian(48)  // meta box (full box)
+        writer.writeBytes(Array("meta".utf8))
+        writer.writeUInt32BigEndian(0)  // version and flags
+        writer.writeUInt32BigEndian(36)  // iprp
+        writer.writeBytes(Array("iprp".utf8))
+        writer.writeUInt32BigEndian(28)  // ipco
+        writer.writeBytes(Array("ipco".utf8))
+        writer.writeUInt32BigEndian(20)  // ispe (full box)
+        writer.writeBytes(Array("ispe".utf8))
+        writer.writeUInt32BigEndian(0)  // version and flags
+        writer.writeUInt32BigEndian(100)
+        writer.writeUInt32BigEndian(50)
+
+        let data = writer.data
+        #expect(ImageFormat(detecting: data) == .heic)
+        #expect(throws: ImageError.unsupportedFeature(
+            reason: "HEIC decoding requires an HEVC (H.265) decoder, which is not implemented (image is 100×50)"
+        )) {
+            _ = try Image(data: data)
+        }
+    }
+
+    @Test func heicEncodingIsUnsupported() {
+        let image = Image(width: 2, height: 2, fill: .white)
+        #expect(throws: ImageError.self) {
+            _ = try image.encoded(as: .heic)
+        }
+    }
+
+    #if canImport(ImageIO)
+    @Test func realHEICFromImageIOIsRecognized() throws {
+        // A genuine HEVC-compressed HEIC from ImageIO must be detected as
+        // HEIC and rejected as unsupported (never mistaken for corrupt data).
+        var pixelData = [UInt8](repeating: 200, count: 64 * 48 * 4)
+        for i in stride(from: 3, to: pixelData.count, by: 4) {
+            pixelData[i] = 255
+        }
+        let context = try #require(CGContext(
+            data: &pixelData,
+            width: 64,
+            height: 48,
+            bitsPerComponent: 8,
+            bytesPerRow: 64 * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let cgImage = try #require(context.makeImage())
+        let output = NSMutableData()
+        let destination = try #require(CGImageDestinationCreateWithData(
+            output, UTType.heic.identifier as CFString, 1, nil
+        ))
+        CGImageDestinationAddImage(destination, cgImage, nil)
+        #expect(CGImageDestinationFinalize(destination))
+
+        let data = output as Data
+        #expect(ImageFormat(detecting: data) == .heic)
+        do {
+            _ = try Image(data: data)
+            Issue.record("Decoding a HEIC should have thrown")
+        } catch let ImageError.unsupportedFeature(reason) {
+            #expect(reason.contains("HEVC"))
+            #expect(reason.contains("64×48"))
+        }
+    }
+    #endif
+
     // MARK: Other formats
 
     @Test func decodingGarbageFails() {
