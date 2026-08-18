@@ -89,7 +89,7 @@ import UniformTypeIdentifiers
         return maximum
     }
 
-    @Test(arguments: [ImageFormat.png, .qoi])
+    @Test(arguments: [ImageFormat.png, .qoi, .tiff, .webp])
     func losslessRoundTrip(format: ImageFormat) throws {
         let original = makeTestImage()
         let encoded = try original.encoded(as: format)
@@ -570,6 +570,335 @@ import UniformTypeIdentifiers
         #expect(ourDecodeMismatches == 0)
     }
     #endif
+
+    // MARK: TIFF
+
+    @Test func tiffDecodesPackBitsGrayscale() throws {
+        // Hand-built 4×2 grayscale TIFF, PackBits-compressed:
+        // a run of four 10s, then the literals 1 2 3 4.
+        var writer = ByteWriter()
+        writer.writeBytes([0x49, 0x49, 42, 0])
+        writer.writeUInt32LittleEndian(16)  // IFD offset (8 header + 7 data + 1 pad)
+        writer.writeBytes([0xFD, 10, 0x03, 1, 2, 3, 4])
+        writer.writeByte(0)  // pad
+
+        writer.writeUInt16LittleEndian(9)
+        func entry(_ tag: Int, _ type: Int, _ value: Int) {
+            writer.writeUInt16LittleEndian(UInt16(tag))
+            writer.writeUInt16LittleEndian(UInt16(type))
+            writer.writeUInt32LittleEndian(1)
+            if type == 3 {
+                writer.writeUInt16LittleEndian(UInt16(value))
+                writer.writeUInt16LittleEndian(0)
+            } else {
+                writer.writeUInt32LittleEndian(UInt32(value))
+            }
+        }
+        entry(256, 4, 4)      // width
+        entry(257, 4, 2)      // height
+        entry(258, 3, 8)      // bits per sample
+        entry(259, 3, 32773)  // PackBits
+        entry(262, 3, 1)      // min is black
+        entry(273, 4, 8)      // strip offset
+        entry(277, 3, 1)      // samples per pixel
+        entry(278, 4, 2)      // rows per strip
+        entry(279, 4, 7)      // strip byte count
+        writer.writeUInt32LittleEndian(0)
+
+        let image = try Image(data: writer.data)
+        #expect(image.width == 4)
+        #expect(image.height == 2)
+        #expect(image[0, 0] == RGBA(red: 10, green: 10, blue: 10))
+        #expect(image[3, 0] == RGBA(red: 10, green: 10, blue: 10))
+        #expect(image[0, 1] == RGBA(red: 1, green: 1, blue: 1))
+        #expect(image[3, 1] == RGBA(red: 4, green: 4, blue: 4))
+    }
+
+    @Test func tiffDecodesDeflateCompressedRGB() throws {
+        // Hand-built 3×1 RGB TIFF with a zlib-compressed strip.
+        let compressed = Deflate.zlibCompress([255, 0, 0, 0, 255, 0, 0, 0, 255])
+        let ifdOffset = 8 + compressed.count + (compressed.count & 1)
+
+        var writer = ByteWriter()
+        writer.writeBytes([0x49, 0x49, 42, 0])
+        writer.writeUInt32LittleEndian(UInt32(ifdOffset))
+        writer.writeBytes(compressed)
+        if compressed.count & 1 == 1 {
+            writer.writeByte(0)
+        }
+        writer.writeUInt16LittleEndian(9)
+        func entry(_ tag: Int, _ type: Int, _ value: Int) {
+            writer.writeUInt16LittleEndian(UInt16(tag))
+            writer.writeUInt16LittleEndian(UInt16(type))
+            writer.writeUInt32LittleEndian(1)
+            if type == 3 {
+                writer.writeUInt16LittleEndian(UInt16(value))
+                writer.writeUInt16LittleEndian(0)
+            } else {
+                writer.writeUInt32LittleEndian(UInt32(value))
+            }
+        }
+        entry(256, 4, 3)  // width
+        entry(257, 4, 1)  // height
+        entry(258, 3, 8)  // bits per sample
+        entry(259, 3, 8)  // Deflate
+        entry(262, 3, 2)  // RGB
+        entry(273, 4, 8)  // strip offset
+        entry(277, 3, 3)  // samples per pixel
+        entry(278, 4, 1)  // rows per strip
+        entry(279, 4, compressed.count)
+        writer.writeUInt32LittleEndian(0)
+
+        let image = try Image(data: writer.data)
+        #expect(image[0, 0] == RGBA(red: 255, green: 0, blue: 0))
+        #expect(image[1, 0] == RGBA(red: 0, green: 255, blue: 0))
+        #expect(image[2, 0] == RGBA(red: 0, green: 0, blue: 255))
+    }
+
+    #if canImport(ImageIO)
+    @Test func tiffInteroperatesWithImageIO() throws {
+        let original = opaque(makeTestImage())
+
+        // Our encoder → Apple's decoder.
+        let encoded = try original.encoded(as: .tiff)
+        let source = try #require(CGImageSourceCreateWithData(encoded as CFData, nil))
+        let cgImage = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        #expect(cgImage.width == original.width)
+        #expect(cgImage.height == original.height)
+
+        var pixelData = [UInt8](repeating: 0, count: original.width * original.height * 4)
+        let context = try #require(CGContext(
+            data: &pixelData,
+            width: original.width,
+            height: original.height,
+            bitsPerComponent: 8,
+            bytesPerRow: original.width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: original.width, height: original.height))
+        var mismatches = 0
+        for y in 0..<original.height {
+            for x in 0..<original.width {
+                let expected = original[x, y]
+                let i = (y * original.width + x) * 4
+                if pixelData[i] != expected.red || pixelData[i + 1] != expected.green
+                    || pixelData[i + 2] != expected.blue {
+                    mismatches += 1
+                }
+            }
+        }
+        #expect(mismatches == 0)
+
+        // Apple's LZW-compressed TIFF → our decoder, still lossless.
+        let appleData = NSMutableData()
+        let destination = try #require(CGImageDestinationCreateWithData(
+            appleData, UTType.tiff.identifier as CFString, 1, nil
+        ))
+        CGImageDestinationAddImage(destination, cgImage, [
+            kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFCompression: 5],
+        ] as CFDictionary)
+        #expect(CGImageDestinationFinalize(destination))
+
+        let redecoded = try Image(data: appleData as Data)
+        #expect(redecoded == original)
+    }
+    #endif
+
+    // MARK: WebP
+
+    #if canImport(ImageIO)
+    @Test func webpIsReadableByImageIO() throws {
+        let original = opaque(makeTestImage())
+        let encoded = try original.encoded(as: .webp)
+        #expect(ImageFormat(detecting: encoded) == .webp)
+
+        let source = try #require(CGImageSourceCreateWithData(encoded as CFData, nil))
+        let cgImage = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        #expect(cgImage.width == original.width)
+        #expect(cgImage.height == original.height)
+
+        var pixelData = [UInt8](repeating: 0, count: original.width * original.height * 4)
+        let context = try #require(CGContext(
+            data: &pixelData,
+            width: original.width,
+            height: original.height,
+            bitsPerComponent: 8,
+            bytesPerRow: original.width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: original.width, height: original.height))
+        var mismatches = 0
+        for y in 0..<original.height {
+            for x in 0..<original.width {
+                let expected = original[x, y]
+                let i = (y * original.width + x) * 4
+                if pixelData[i] != expected.red || pixelData[i + 1] != expected.green
+                    || pixelData[i + 2] != expected.blue {
+                    mismatches += 1
+                }
+            }
+        }
+        #expect(mismatches == 0)
+    }
+    #endif
+
+    /// Wraps a VP8L bitstream in a RIFF/WebP container.
+    private func wrapVP8L(_ bits: BitWriter) -> Data {
+        var mutableBits = bits
+        var payload: [UInt8] = [0x2F]
+        payload += mutableBits.finish()
+        var writer = ByteWriter()
+        writer.writeBytes(Array("RIFF".utf8))
+        writer.writeUInt32LittleEndian(UInt32(4 + 8 + payload.count + (payload.count & 1)))
+        writer.writeBytes(Array("WEBP".utf8))
+        writer.writeBytes(Array("VP8L".utf8))
+        writer.writeUInt32LittleEndian(UInt32(payload.count))
+        writer.writeBytes(payload)
+        if payload.count & 1 == 1 {
+            writer.writeByte(0)
+        }
+        return writer.data
+    }
+
+    @Test func webpDecodesSubtractGreenCacheAndBackReferences() throws {
+        // Hand-built 4×1 VP8L stream: subtract-green transform, a 16-entry
+        // color cache, one literal, one cache hit and one LZ77 copy of
+        // length 2 at distance 1 (distance code 121 = plain distance 1).
+        let literal: UInt32 = 0xFF0A_141E  // a 255, r 10, g 20, b 30 (residual domain)
+        let cacheIndex = Int((0x1E35_A7BD as UInt32 &* literal) >> 28)
+
+        var bits = BitWriter()
+        bits.writeBits(3, count: 14)  // width 4
+        bits.writeBits(0, count: 14)  // height 1
+        bits.writeBits(0, count: 1)   // alpha hint
+        bits.writeBits(0, count: 3)   // version
+        bits.writeBits(1, count: 1)
+        bits.writeBits(2, count: 2)   // subtract-green transform
+        bits.writeBits(0, count: 1)   // no more transforms
+        bits.writeBits(1, count: 1)
+        bits.writeBits(4, count: 4)   // color cache with 16 entries
+        bits.writeBits(0, count: 1)   // no meta prefix groups
+
+        // Green code (alphabet 296): lengths {20: 2, 257: 2, 280+cacheIndex: 1},
+        // written with a code-length code over {1, 2, 17, 18}, all two bits:
+        // canonical codes 1→00, 2→01, 17→10, 18→11.
+        bits.writeBits(0, count: 1)   // not simple
+        bits.writeBits(1, count: 4)   // five code-length code lengths (17, 18, 0, 1, 2)
+        for length in [2, 2, 0, 2, 2] {
+            bits.writeBits(length, count: 3)
+        }
+        bits.writeBits(1, count: 1)   // explicit symbol budget
+        bits.writeBits(3, count: 3)   // budget field is 8 bits wide
+        bits.writeBits(5, count: 8)   // budget 7 = 2 + 5 code-length symbols
+        bits.writeCode(0b11, length: 2)
+        bits.writeBits(9, count: 7)   // 18: twenty zeros (symbols 0-19)
+        bits.writeCode(0b01, length: 2)  // symbol 20 gets length 2
+        bits.writeCode(0b11, length: 2)
+        bits.writeBits(127, count: 7)  // 18: 138 zeros
+        bits.writeCode(0b11, length: 2)
+        bits.writeBits(87, count: 7)   // 18: 98 more zeros (symbols 21-256)
+        bits.writeCode(0b01, length: 2)  // symbol 257 gets length 2
+        bits.writeCode(0b11, length: 2)
+        bits.writeBits(11 + cacheIndex, count: 7)  // 18: zeros up to the cache symbol
+        bits.writeCode(0b00, length: 2)  // symbol 280+cacheIndex gets length 1
+
+        // Red, blue, alpha: single-symbol simple codes (10, 30, 255).
+        for value in [10, 30, 255] {
+            bits.writeBits(1, count: 1)
+            bits.writeBits(0, count: 1)
+            bits.writeBits(1, count: 1)
+            bits.writeBits(value, count: 8)
+        }
+        // Distance: single-symbol simple code, symbol 13.
+        bits.writeBits(1, count: 1)
+        bits.writeBits(0, count: 1)
+        bits.writeBits(1, count: 1)
+        bits.writeBits(13, count: 8)
+
+        // Canonical green codes: cache symbol → 0, literal 20 → 10, length 257 → 11.
+        bits.writeCode(0b10, length: 2)  // literal pixel
+        bits.writeCode(0b0, length: 1)   // cache hit
+        bits.writeCode(0b11, length: 2)  // match, length 2
+        bits.writeBits(24, count: 5)     // distance extra bits: 97 + 24 = code 121
+
+        let image = try Image(data: wrapVP8L(bits))
+        #expect(image.width == 4)
+        #expect(image.height == 1)
+        for x in 0..<4 {
+            // Subtract-green inverse: r = 10+20, b = 30+20.
+            #expect(image[x, 0] == RGBA(red: 30, green: 20, blue: 50), "pixel \(x)")
+        }
+    }
+
+    @Test func webpDecodesPredictorTransform() throws {
+        // Hand-built 2×2 VP8L stream with a predictor transform (one block,
+        // mode 7 = Average2(L, T)); the borders use the black, L and T rules.
+        var bits = BitWriter()
+        bits.writeBits(1, count: 14)  // width 2
+        bits.writeBits(1, count: 14)  // height 2
+        bits.writeBits(0, count: 1)
+        bits.writeBits(0, count: 3)
+        bits.writeBits(1, count: 1)
+        bits.writeBits(0, count: 2)   // predictor transform
+        bits.writeBits(0, count: 3)   // block bits 2 → a single block
+        // Sub-image (1×1): no cache; green single(7) = mode 7, others single(0).
+        bits.writeBits(0, count: 1)   // no color cache
+        bits.writeBits(1, count: 1)   // green: simple
+        bits.writeBits(0, count: 1)   // one symbol
+        bits.writeBits(1, count: 1)   // eight bits
+        bits.writeBits(7, count: 8)   // mode 7
+        for _ in 0..<4 {              // red, blue, alpha, distance: single symbol 0
+            bits.writeBits(1, count: 1)
+            bits.writeBits(0, count: 1)
+            bits.writeBits(0, count: 1)
+            bits.writeBits(0, count: 1)
+        }
+        bits.writeBits(0, count: 1)   // end of transforms
+        bits.writeBits(0, count: 1)   // no color cache
+        bits.writeBits(0, count: 1)   // no meta prefix groups
+        // Main image residuals: greens {3, 10}, reds {1, 2}, blue single 2, alpha single 0.
+        bits.writeBits(1, count: 1)   // green: simple, two symbols
+        bits.writeBits(1, count: 1)
+        bits.writeBits(1, count: 1)
+        bits.writeBits(3, count: 8)
+        bits.writeBits(10, count: 8)
+        bits.writeBits(1, count: 1)   // red: simple, two symbols
+        bits.writeBits(1, count: 1)
+        bits.writeBits(1, count: 1)
+        bits.writeBits(1, count: 8)
+        bits.writeBits(2, count: 8)
+        bits.writeBits(1, count: 1)   // blue: single symbol 2
+        bits.writeBits(0, count: 1)
+        bits.writeBits(1, count: 1)
+        bits.writeBits(2, count: 8)
+        bits.writeBits(1, count: 1)   // alpha: single symbol 0
+        bits.writeBits(0, count: 1)
+        bits.writeBits(0, count: 1)
+        bits.writeBits(0, count: 1)
+        bits.writeBits(1, count: 1)   // distance: single symbol 0
+        bits.writeBits(0, count: 1)
+        bits.writeBits(0, count: 1)
+        bits.writeBits(0, count: 1)
+        // Residuals (canonical: green 3→0, 10→1; red 1→0, 2→1):
+        bits.writeCode(1, length: 1)  // P(0,0): g 10
+        bits.writeCode(0, length: 1)  //          r 1
+        bits.writeCode(1, length: 1)  // P(1,0): g 10
+        bits.writeCode(0, length: 1)  //          r 1
+        bits.writeCode(0, length: 1)  // P(0,1): g 3
+        bits.writeCode(1, length: 1)  //          r 2
+        bits.writeCode(0, length: 1)  // P(1,1): g 3
+        bits.writeCode(0, length: 1)  //          r 1
+
+        let image = try Image(data: wrapVP8L(bits))
+        #expect(image.width == 2)
+        #expect(image.height == 2)
+        #expect(image[0, 0] == RGBA(red: 1, green: 10, blue: 2))    // black predictor
+        #expect(image[1, 0] == RGBA(red: 2, green: 20, blue: 4))    // L predictor
+        #expect(image[0, 1] == RGBA(red: 3, green: 13, blue: 4))    // T predictor
+        #expect(image[1, 1] == RGBA(red: 3, green: 19, blue: 6))    // mode 7: Average2(L, T)
+    }
 
     // MARK: Other formats
 

@@ -5,6 +5,8 @@ public enum ImageFormat: String, CaseIterable, Sendable {
     case png
     case jpeg
     case gif
+    case tiff
+    case webp
     case bmp
     case qoi
     /// Netpbm binary formats (PPM/PGM).
@@ -16,6 +18,8 @@ public enum ImageFormat: String, CaseIterable, Sendable {
         case .png: "png"
         case .jpeg: "jpg"
         case .gif: "gif"
+        case .tiff: "tiff"
+        case .webp: "webp"
         case .bmp: "bmp"
         case .qoi: "qoi"
         case .netpbm: "ppm"
@@ -35,6 +39,8 @@ public enum ImageFormat: String, CaseIterable, Sendable {
         case .png: PNGCodec.self
         case .jpeg: JPEGCodec.self
         case .gif: GIFCodec.self
+        case .tiff: TIFFCodec.self
+        case .webp: WebPCodec.self
         case .bmp: BMPCodec.self
         case .qoi: QOICodec.self
         case .netpbm: NetpbmCodec.self
