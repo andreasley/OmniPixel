@@ -72,6 +72,72 @@ import Testing
         #expect(scaled[10, 10] == .white)
     }
 
+    @Test func rotationMovesPixelsCorrectly() {
+        // 3×2 with distinct corners: white at the top left, red at the bottom right.
+        let red = RGBA(red: 255, green: 0, blue: 0)
+        var image = Image(width: 3, height: 2, fill: .black)
+        image[0, 0] = .white
+        image[2, 1] = red
+
+        let quarter = image.rotated(by: .clockwise90)
+        #expect(quarter.width == 2)
+        #expect(quarter.height == 3)
+        #expect(quarter[1, 0] == .white)  // top left → top right
+        #expect(quarter[0, 2] == red)     // bottom right → bottom left
+
+        let half = image.rotated(by: .clockwise180)
+        #expect(half.width == 3)
+        #expect(half.height == 2)
+        #expect(half[2, 1] == .white)
+        #expect(half[0, 0] == red)
+
+        let threeQuarters = image.rotated(by: .clockwise270)
+        #expect(threeQuarters.width == 2)
+        #expect(threeQuarters.height == 3)
+        #expect(threeQuarters[0, 2] == .white)  // top left → bottom left
+        #expect(threeQuarters[1, 0] == red)     // bottom right → top right
+    }
+
+    @Test func mirroringSwapsEdges() {
+        let red = RGBA(red: 255, green: 0, blue: 0)
+        var image = Image(width: 3, height: 2, fill: .black)
+        image[0, 0] = .white
+        image[2, 1] = red
+
+        let horizontal = image.mirrored(across: .horizontal)
+        #expect(horizontal[2, 0] == .white)
+        #expect(horizontal[0, 1] == red)
+        #expect(horizontal[1, 0] == .black)
+
+        let vertical = image.mirrored(across: .vertical)
+        #expect(vertical[0, 1] == .white)
+        #expect(vertical[2, 0] == red)
+    }
+
+    @Test func orientationOperationsComposeCorrectly() {
+        // An asymmetric gradient so any misplaced pixel breaks equality.
+        var image = Image(width: 7, height: 5)
+        for y in 0..<image.height {
+            for x in 0..<image.width {
+                image[x, y] = RGBA(
+                    red: UInt8(x * 30),
+                    green: UInt8(y * 40),
+                    blue: UInt8(x * 5 + y * 11),
+                    alpha: UInt8(255 - x - y)
+                )
+            }
+        }
+
+        #expect(image.rotated(by: .clockwise90).rotated(by: .clockwise90).rotated(by: .clockwise90).rotated(by: .clockwise90) == image)
+        #expect(image.rotated(by: .clockwise90).rotated(by: .clockwise270) == image)
+        #expect(image.rotated(by: .clockwise90).rotated(by: .clockwise90) == image.rotated(by: .clockwise180))
+        #expect(image.rotated(by: .clockwise180).rotated(by: .clockwise180) == image)
+        #expect(image.mirrored(across: .horizontal).mirrored(across: .horizontal) == image)
+        #expect(image.mirrored(across: .vertical).mirrored(across: .vertical) == image)
+        // Mirroring across both axes is a half turn.
+        #expect(image.mirrored(across: .horizontal).mirrored(across: .vertical) == image.rotated(by: .clockwise180))
+    }
+
     @Test func resizeRejectsInvalidDimensions() {
         let image = Image(width: 2, height: 2)
         #expect(throws: ImageError.invalidDimensions) {
