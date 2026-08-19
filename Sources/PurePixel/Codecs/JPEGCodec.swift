@@ -600,21 +600,46 @@ enum JPEGCodec: ImageCodec {
             let planeWidth = component.blockColumns * 8
             var plane = [UInt8](repeating: 0, count: planeWidth * component.blockRows * 8)
 
+            // Scratch buffers shared by every block of the plane.
+            var dequantized = [Int](repeating: 0, count: 64)
+            var scratch = [Int](repeating: 0, count: 64)
+
             for blockRow in 0..<component.blockRows {
                 for blockColumn in 0..<component.blockColumns {
                     let base = (blockRow * component.blockColumns + blockColumn) * 64
-                    var natural = [Double](repeating: 0, count: 64)
-                    for k in 0..<64 {
-                        natural[zigzag[k]] = Double(component.coefficients[base + k] * quantization[k])
-                    }
-                    let samples = inverseTransform(natural)
                     let originX = blockColumn * 8
                     let originY = blockRow * 8
-                    for row in 0..<8 {
-                        for column in 0..<8 {
-                            plane[(originY + row) * planeWidth + originX + column] = samples[row * 8 + column]
-                        }
+
+                    // DC-only blocks (common at moderate quality) are a
+                    // flat fill: the IDCT of a lone DC term is dc/8.
+                    var hasAC = false
+                    for k in 1..<64 where component.coefficients[base + k] != 0 {
+                        hasAC = true
+                        break
                     }
+                    if !hasAC {
+                        let dc = component.coefficients[base] * quantization[0]
+                        let magnitude = (abs(dc) + 4) >> 3
+                        let value = UInt8(min(max((dc >= 0 ? magnitude : -magnitude) + 128, 0), 255))
+                        for row in 0..<8 {
+                            let planeRow = (originY + row) * planeWidth + originX
+                            for column in 0..<8 {
+                                plane[planeRow + column] = value
+                            }
+                        }
+                        continue
+                    }
+
+                    // Dequantize straight from zigzag into natural order;
+                    // the permutation touches all 64 slots, so no clearing
+                    // is needed.
+                    for k in 0..<64 {
+                        dequantized[zigzag[k]] = component.coefficients[base + k] * quantization[k]
+                    }
+                    inverseTransform(
+                        dequantized, scratch: &scratch,
+                        into: &plane, planeWidth: planeWidth, originX: originX, originY: originY
+                    )
                 }
             }
             planes.append(plane)
@@ -623,28 +648,37 @@ enum JPEGCodec: ImageCodec {
 
         var pixels = [RGBA](repeating: .transparent, count: frame.width * frame.height)
         if frame.components.count == 1 {
+            let plane = planes[0]
+            let planeWidth = planeWidths[0]
             for y in 0..<frame.height {
+                let rowBase = y * planeWidth
                 for x in 0..<frame.width {
-                    let value = planes[0][y * planeWidths[0] + x]
+                    let value = plane[rowBase + x]
                     pixels[y * frame.width + x] = RGBA(red: value, green: value, blue: value)
                 }
             }
         } else {
-            func sample(_ index: Int, _ x: Int, _ y: Int) -> Double {
-                let component = frame.components[index]
-                let sampleX = x * component.horizontalSampling / frame.maxHorizontalSampling
-                let sampleY = y * component.verticalSampling / frame.maxVerticalSampling
-                return Double(planes[index][sampleY * planeWidths[index] + sampleX])
+            // Upsampling positions precomputed per column; the row position
+            // is computed once per row. BT.601 in 16.16 fixed point.
+            let columnMaps = frame.components.map { component in
+                (0..<frame.width).map { $0 * component.horizontalSampling / frame.maxHorizontalSampling }
             }
             for y in 0..<frame.height {
+                let rowBases = frame.components.indices.map { index in
+                    (y * frame.components[index].verticalSampling / frame.maxVerticalSampling) * planeWidths[index]
+                }
+                let pixelRow = y * frame.width
                 for x in 0..<frame.width {
-                    let brightness = sample(0, x, y)
-                    let blueChroma = sample(1, x, y) - 128
-                    let redChroma = sample(2, x, y) - 128
-                    pixels[y * frame.width + x] = RGBA(
-                        red: clampedChannel(brightness + 1.402 * redChroma),
-                        green: clampedChannel(brightness - 0.344136 * blueChroma - 0.714136 * redChroma),
-                        blue: clampedChannel(brightness + 1.772 * blueChroma)
+                    let luma = Int(planes[0][rowBases[0] + columnMaps[0][x]]) << 16
+                    let blueChroma = Int(planes[1][rowBases[1] + columnMaps[1][x]]) - 128
+                    let redChroma = Int(planes[2][rowBases[2] + columnMaps[2][x]]) - 128
+                    let red = (luma + 91881 * redChroma + 32768) >> 16
+                    let green = (luma - 22554 * blueChroma - 46802 * redChroma + 32768) >> 16
+                    let blue = (luma + 116131 * blueChroma + 32768) >> 16
+                    pixels[pixelRow + x] = RGBA(
+                        red: UInt8(min(max(red, 0), 255)),
+                        green: UInt8(min(max(green, 0), 255)),
+                        blue: UInt8(min(max(blue, 0), 255))
                     )
                 }
             }
@@ -652,35 +686,64 @@ enum JPEGCodec: ImageCodec {
         return Image(width: frame.width, height: frame.height, pixels: pixels)
     }
 
-    /// 8×8 inverse DCT, returning clamped samples after the +128 level shift.
-    private static func inverseTransform(_ coefficients: [Double]) -> [UInt8] {
-        var samples = [UInt8](repeating: 0, count: 64)
-        for y in 0..<8 {
+    /// The decoder's fixed-point IDCT basis: idctTable[u·8 + x] =
+    /// norm(u)·cos((2x+1)·u·π/16) at ×2048.
+    private static let idctTable: [Int] = {
+        var table = [Int](repeating: 0, count: 64)
+        for u in 0..<8 {
             for x in 0..<8 {
-                var sum = 0.0
-                for v in 0..<8 {
-                    for u in 0..<8 {
-                        sum += normalization[u] * normalization[v] * coefficients[v * 8 + u]
-                            * cosineTable[u][x] * cosineTable[v][y]
-                    }
-                }
-                let value = (sum / 4 + 128).rounded()
-                samples[y * 8 + x] = UInt8(min(max(value, 0), 255))
+                table[u * 8 + x] = Int((normalization[u] * cosineTable[u][x] * 2048).rounded())
             }
         }
-        return samples
-    }
+        return table
+    }()
 
-    private static func clampedChannel(_ value: Double) -> UInt8 {
-        UInt8(min(max(value.rounded(), 0), 255))
+    /// Separable integer 8×8 inverse DCT: rows first (result kept at ×256),
+    /// then columns with the final descale, +128 level shift and clamp,
+    /// written directly into the sample plane.
+    private static func inverseTransform(
+        _ coefficients: [Int],
+        scratch: inout [Int],
+        into plane: inout [UInt8],
+        planeWidth: Int,
+        originX: Int,
+        originY: Int
+    ) {
+        for v in 0..<8 {
+            let rowBase = v * 8
+            for x in 0..<8 {
+                var sum = 0
+                for u in 0..<8 {
+                    sum += coefficients[rowBase + u] * idctTable[u * 8 + x]
+                }
+                scratch[rowBase + x] = (sum + 4) >> 3  // ×2048 → ×256
+            }
+        }
+        for y in 0..<8 {
+            let planeRow = (originY + y) * planeWidth + originX
+            for x in 0..<8 {
+                var sum = 0
+                for v in 0..<8 {
+                    sum += scratch[v * 8 + x] * idctTable[v * 8 + y]
+                }
+                // Scale is 256·2048 with the DCT's ÷4 still pending: 2²¹.
+                let value = ((sum + (1 << 20)) >> 21) + 128
+                plane[planeRow + x] = UInt8(min(max(value, 0), 255))
+            }
+        }
     }
 }
 
 /// A canonical JPEG Huffman table (counts per code length plus symbols in
-/// code order), decoded bit by bit exactly like the DEFLATE tables.
+/// code order). Codes of up to eight bits — the overwhelming majority —
+/// resolve through a 256-entry lookup on the next byte of the bitstream;
+/// longer codes fall back to the canonical bit-by-bit walk.
 struct JPEGHuffmanTable {
     private let countsByLength: [Int]  // index 1...16; index 0 unused
     private let symbols: [UInt8]
+    /// Indexed by the next 8 bits: (code length << 8) | symbol, or 0 when
+    /// the code is longer than 8 bits.
+    private let lookup: [UInt16]
 
     init(countsByLength: [Int], symbols: [UInt8]) throws {
         guard countsByLength.count == 17,
@@ -697,9 +760,36 @@ struct JPEGHuffmanTable {
         }
         self.countsByLength = countsByLength
         self.symbols = symbols
+
+        var lookup = [UInt16](repeating: 0, count: 256)
+        var code = 0
+        var symbolIndex = 0
+        for length in 1...16 {
+            for _ in 0..<countsByLength[length] {
+                if length <= 8 {
+                    let first = code << (8 - length)
+                    let entry = UInt16(length << 8) | UInt16(symbols[symbolIndex])
+                    for slot in first..<(first + (1 << (8 - length))) {
+                        lookup[slot] = entry
+                    }
+                }
+                code += 1
+                symbolIndex += 1
+            }
+            code <<= 1
+        }
+        self.lookup = lookup
     }
 
     func decodeSymbol(from reader: inout JPEGBitReader) throws -> Int {
+        if let peeked = reader.peekByte() {
+            let entry = lookup[peeked]
+            if entry != 0 {
+                reader.skipBits(Int(entry >> 8))
+                return Int(entry & 0xFF)
+            }
+        }
+        // Long code or near the end of the data: canonical walk.
         var code = 0
         var first = 0
         var index = 0
@@ -717,67 +807,109 @@ struct JPEGHuffmanTable {
     }
 }
 
-/// Reads bits most-significant-bit first from JPEG entropy-coded data,
-/// removing stuffed zero bytes after 0xFF and validating restart markers.
+/// Reads bits most-significant-bit first from JPEG entropy-coded data.
+///
+/// Each restart interval's bytes are unstuffed (the 0x00 after a data 0xFF
+/// removed) in a single pass up front, so the hot path is a plain 64-bit
+/// shift buffer with no byte-stuffing branches.
 struct JPEGBitReader {
     private let bytes: [UInt8]
-    private var offset: Int
-    private var currentByte: UInt8 = 0
-    private var bitsRemaining = 0
+    private var segment: [UInt8] = []   // unstuffed entropy bytes up to the next marker
+    private var segmentOffset = 0
+    private var segmentEndOffset = 0    // raw offset of the marker (or end) that ended the segment
+    private var buffer: UInt64 = 0
+    private var bitsInBuffer = 0
 
     init(bytes: [UInt8], startingAt offset: Int) {
         self.bytes = bytes
-        self.offset = offset
+        scanSegment(from: offset)
     }
 
-    /// The offset of the next unconsumed byte.
+    /// The raw offset of the marker that terminated the entropy data.
     var byteOffset: Int {
-        offset
+        segmentEndOffset
+    }
+
+    /// Unstuffs entropy bytes from `start` up to the next real marker
+    /// (anything but FF 00) or the end of the data.
+    private mutating func scanSegment(from start: Int) {
+        var unstuffed = [UInt8]()
+        unstuffed.reserveCapacity(min(bytes.count - start, 1 << 16))
+        var offset = start
+        while offset < bytes.count {
+            let byte = bytes[offset]
+            if byte == 0xFF {
+                guard offset + 1 < bytes.count, bytes[offset + 1] == 0x00 else {
+                    break
+                }
+                unstuffed.append(0xFF)
+                offset += 2
+            } else {
+                unstuffed.append(byte)
+                offset += 1
+            }
+        }
+        segment = unstuffed
+        segmentOffset = 0
+        segmentEndOffset = offset
+        buffer = 0
+        bitsInBuffer = 0
+    }
+
+    private mutating func refill() {
+        while bitsInBuffer <= 56, segmentOffset < segment.count {
+            buffer = buffer << 8 | UInt64(segment[segmentOffset])
+            segmentOffset += 1
+            bitsInBuffer += 8
+        }
     }
 
     mutating func readBit() throws -> Int {
-        if bitsRemaining == 0 {
-            try refill()
+        if bitsInBuffer == 0 {
+            refill()
+            guard bitsInBuffer > 0 else {
+                throw ImageError.invalidData(reason: "JPEG entropy data ended early")
+            }
         }
-        bitsRemaining -= 1
-        return Int(currentByte >> bitsRemaining) & 1
+        bitsInBuffer -= 1
+        return Int((buffer >> UInt64(bitsInBuffer)) & 1)
     }
 
     mutating func readBits(_ count: Int) throws -> Int {
-        var value = 0
-        for _ in 0..<count {
-            value = value << 1 | (try readBit())
-        }
-        return value
-    }
-
-    /// Discards partial bits, then consumes the expected RSTn marker.
-    mutating func synchronizeToRestartMarker(expecting index: Int) throws {
-        bitsRemaining = 0
-        guard offset + 2 <= bytes.count,
-              bytes[offset] == 0xFF,
-              bytes[offset + 1] == 0xD0 + UInt8(index) else {
-            throw ImageError.invalidData(reason: "Missing JPEG restart marker")
-        }
-        offset += 2
-    }
-
-    private mutating func refill() throws {
-        guard offset < bytes.count else {
-            throw ImageError.invalidData(reason: "JPEG entropy data ended early")
-        }
-        let byte = bytes[offset]
-        offset += 1
-        if byte == 0xFF {
-            guard offset < bytes.count else {
+        guard count > 0 else { return 0 }
+        if bitsInBuffer < count {
+            refill()
+            guard bitsInBuffer >= count else {
                 throw ImageError.invalidData(reason: "JPEG entropy data ended early")
             }
-            guard bytes[offset] == 0x00 else {
-                throw ImageError.invalidData(reason: "Unexpected marker inside JPEG entropy data")
-            }
-            offset += 1  // skip the stuffed zero byte
         }
-        currentByte = byte
-        bitsRemaining = 8
+        bitsInBuffer -= count
+        return Int((buffer >> UInt64(bitsInBuffer)) & UInt64((1 << count) - 1))
+    }
+
+    /// The next 8 bits without consuming them, or nil when fewer remain
+    /// (the Huffman fast path; the slow path handles the stream tail).
+    mutating func peekByte() -> Int? {
+        if bitsInBuffer < 8 {
+            refill()
+            guard bitsInBuffer >= 8 else { return nil }
+        }
+        return Int((buffer >> UInt64(bitsInBuffer - 8)) & 0xFF)
+    }
+
+    /// Consumes bits previously seen via `peekByte`.
+    mutating func skipBits(_ count: Int) {
+        bitsInBuffer -= count
+    }
+
+    /// Discards remaining buffered bits, consumes the expected RSTn marker
+    /// and unstuffs the next restart interval.
+    mutating func synchronizeToRestartMarker(expecting index: Int) throws {
+        guard segmentEndOffset + 2 <= bytes.count,
+              bytes[segmentEndOffset] == 0xFF,
+              bytes[segmentEndOffset + 1] == 0xD0 + UInt8(index) else {
+            throw ImageError.invalidData(reason: "Missing JPEG restart marker")
+        }
+        scanSegment(from: segmentEndOffset + 2)
     }
 }
