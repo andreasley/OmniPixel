@@ -1,6 +1,6 @@
 # PurePixel
 
-A cross-platform image library written entirely in Swift. It reads and writes the common image formats, converts between them, and offers basic editing — with **zero dependencies** beyond Foundation's `Data`, so the same code runs on macOS, iOS and Linux.
+A cross-platform image library written entirely in Swift. It reads and writes the common image formats, converts between them, and offers basic editing — with **zero dependencies** beyond the Swift core libraries (Foundation's `Data`, plus Dispatch for decoding HEIC tiles in parallel), so the same code runs on macOS, iOS and Linux.
 
 PurePixel is built for correctness and safety rather than raw speed: every decoder is bounds-checked and throws typed errors on malformed input, all public types are value types and `Sendable`, and the compression layers (DEFLATE, two LZW dialects, VP8L, JPEG entropy coding, HEVC CABAC) are implemented from scratch in Swift. Output is routinely validated against Apple's ImageIO and zlib in the test suite.
 

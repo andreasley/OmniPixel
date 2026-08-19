@@ -70,6 +70,10 @@ final class HEVCPictureDecoder {
     private var currentTransquantBypass = false
     private var currentChromaMode = 1
 
+    // Residual-decoding scratch, reused for every sub-block.
+    private var positionScratch = [Int](repeating: 0, count: 16)
+    private var levelScratch = [Int](repeating: 0, count: 16)
+
     private(set) var picture = HEVCPictureData()
 
     /// Diagnostic hook for decoder bring-up: receives coarse syntax events.
@@ -704,19 +708,20 @@ final class HEVCPictureDecoder {
             fineTrace?("      sb (\(subBlock.x),\(subBlock.y)) coded \(coded) prev \(previousCoded) @bit \(cabac.bitPosition)")
 
             if coded {
-                var significant = [Bool](repeating: false, count: 16)
-                var anySignificant = false
+                // Significant positions collected in decode order (highest
+                // scan position first) into a reused scratch buffer.
+                var positionCount = 0
                 var startPosition = 15
                 if isLast {
-                    significant[lastScanPosition] = true
-                    anySignificant = true
+                    positionScratch[0] = lastScanPosition
+                    positionCount = 1
                     startPosition = lastScanPosition - 1
                 }
                 var position = startPosition
                 while position >= 0 {
-                    if position == 0 && inferDCSignificance && !anySignificant {
-                        significant[0] = true
-                        anySignificant = true
+                    if position == 0 && inferDCSignificance && positionCount == 0 {
+                        positionScratch[0] = 0
+                        positionCount = 1
                     } else {
                         let coordinate = coefficientScan[position]
                         let context = significanceContext(
@@ -728,15 +733,14 @@ final class HEVCPictureDecoder {
                             previousCoded: previousCoded
                         )
                         if try cabac.decodeBin(&contexts.significantCoefficient[context]) == 1 {
-                            significant[position] = true
-                            anySignificant = true
+                            positionScratch[positionCount] = position
+                            positionCount += 1
                         }
                     }
                     position -= 1
                 }
 
-                let significantPositions = (0...15).reversed().filter { significant[$0] }
-                if !significantPositions.isEmpty {
+                if positionCount > 0 {
                     // Context set for the greater-than-1 flags.
                     var contextSet = (isFirst || componentIndex > 0) ? 0 : 2
                     if let previous = previousGreater1Context, previous == 0 {
@@ -744,15 +748,14 @@ final class HEVCPictureDecoder {
                     }
                     var greater1Context = 1
 
-                    var greater1 = [Int: Bool]()
-                    var greater2Position: Int?
-                    for (rank, coefficientPosition) in significantPositions.enumerated() where rank < 8 {
+                    var greater1Mask = 0  // bit per rank
+                    var greater2Rank = -1
+                    for rank in 0..<min(positionCount, 8) {
                         let contextIndex = (componentIndex > 0 ? 16 : 0) + contextSet * 4 + min(greater1Context, 3)
-                        let flag = try cabac.decodeBin(&contexts.greater1[contextIndex]) == 1
-                        greater1[coefficientPosition] = flag
-                        if flag {
-                            if greater2Position == nil {
-                                greater2Position = coefficientPosition
+                        if try cabac.decodeBin(&contexts.greater1[contextIndex]) == 1 {
+                            greater1Mask |= 1 << rank
+                            if greater2Rank < 0 {
+                                greater2Rank = rank
                             }
                             greater1Context = 0
                         } else if greater1Context > 0 {
@@ -762,38 +765,31 @@ final class HEVCPictureDecoder {
                     previousGreater1Context = greater1Context
 
                     var greater2 = false
-                    if greater2Position != nil {
+                    if greater2Rank >= 0 {
                         let contextIndex = (componentIndex > 0 ? 4 : 0) + contextSet
                         greater2 = try cabac.decodeBin(&contexts.greater2[contextIndex]) == 1
                     }
 
-                    // Signs (possibly hiding the lowest-frequency one).
-                    let firstPosition = significantPositions.last!
-                    let lastPosition = significantPositions.first!
-                    let signHidden = pps.signDataHidingEnabled
+                    // Signs, batched into one bypass read (the hidden sign of
+                    // the lowest-frequency coefficient is the last rank).
+                    let hiddenRank = pps.signDataHidingEnabled
                         && !currentTransquantBypass
-                        && lastPosition - firstPosition > 3
-                    var negative = [Int: Bool]()
-                    for coefficientPosition in significantPositions {
-                        if signHidden && coefficientPosition == firstPosition {
-                            continue
-                        }
-                        negative[coefficientPosition] = try cabac.decodeBypass() == 1
-                    }
+                        && positionScratch[0] - positionScratch[positionCount - 1] > 3
+                        ? positionCount - 1 : -1
+                    let signCount = hiddenRank >= 0 ? positionCount - 1 : positionCount
+                    let signBits = try cabac.decodeBypassBits(signCount)
 
-                    // Absolute levels.
+                    // Absolute levels: coeff_abs_level_remaining is present
+                    // only when the decoded flags saturated — greater1 == 0
+                    // pins the level at exactly 1, greater2 == 0 at 2.
                     var riceParameter = 0
                     var sumOfLevels = 0
-                    var levels = [Int: Int]()
-                    for (rank, coefficientPosition) in significantPositions.enumerated() {
-                        // coeff_abs_level_remaining is present only when the
-                        // decoded flags saturated: greater1 == 0 pins the
-                        // level at exactly 1, greater2 == 0 at exactly 2.
+                    for rank in 0..<positionCount {
                         let baseLevel: Int
                         let needsRemaining: Bool
                         if rank < 8 {
-                            if greater1[coefficientPosition] == true {
-                                if coefficientPosition == greater2Position {
+                            if greater1Mask & (1 << rank) != 0 {
+                                if rank == greater2Rank {
                                     baseLevel = greater2 ? 3 : 2
                                     needsRemaining = greater2
                                 } else {
@@ -816,21 +812,25 @@ final class HEVCPictureDecoder {
                                 riceParameter = min(riceParameter + 1, 4)
                             }
                         }
-                        levels[coefficientPosition] = level
+                        levelScratch[rank] = level
                         sumOfLevels += level
                     }
-                    fineTrace?("      levels \(significantPositions.map { levels[$0] ?? 1 }) gt1 \(significantPositions.map { greater1[$0] == true ? 1 : 0 }) gt2 \(greater2 ? 1 : 0) set \(contextSet) @bit \(cabac.bitPosition)")
+                    if fineTrace != nil {
+                        let levels = (0..<positionCount).map { levelScratch[$0] }
+                        let flags = (0..<positionCount).map { greater1Mask & (1 << $0) != 0 ? 1 : 0 }
+                        fineTrace?("      levels \(levels) gt1 \(flags) gt2 \(greater2 ? 1 : 0) set \(contextSet) @bit \(cabac.bitPosition)")
+                    }
 
-                    for coefficientPosition in significantPositions {
-                        let coordinate = coefficientScan[coefficientPosition]
+                    for rank in 0..<positionCount {
+                        let coordinate = coefficientScan[positionScratch[rank]]
                         let absoluteX = (subBlock.x << 2) | coordinate.x
                         let absoluteY = (subBlock.y << 2) | coordinate.y
-                        var value = levels[coefficientPosition] ?? 1
+                        var value = levelScratch[rank]
                         let isNegative: Bool
-                        if signHidden && coefficientPosition == firstPosition {
+                        if rank == hiddenRank {
                             isNegative = sumOfLevels % 2 == 1
                         } else {
-                            isNegative = negative[coefficientPosition] ?? false
+                            isNegative = signBits >> (signCount - 1 - rank) & 1 == 1
                         }
                         if isNegative {
                             value = -value
@@ -842,8 +842,10 @@ final class HEVCPictureDecoder {
             subBlockIndex -= 1
         }
 
-        let nonZeroCount = coefficients.count(where: { $0 != 0 })
-        trace?("    RES c\(componentIndex) (\(x),\(y)) size \(size) scan \(scanIndex) last (\(lastX),\(lastY)) nz \(nonZeroCount) @bit \(cabac.bitPosition)")
+        if trace != nil {
+            let nonZeroCount = coefficients.count(where: { $0 != 0 })
+            trace?("    RES c\(componentIndex) (\(x),\(y)) size \(size) scan \(scanIndex) last (\(lastX),\(lastY)) nz \(nonZeroCount) @bit \(cabac.bitPosition)")
+        }
 
         picture.transformBlocks.append(HEVCPictureData.TransformBlock(
             componentIndex: componentIndex,

@@ -63,18 +63,29 @@ struct CABACContext {
 
 /// The CABAC arithmetic decoding engine (ITU-T H.265 section 9.3.4.3):
 /// a 9-bit range/offset decoder with table-driven probability adaptation,
-/// plus the bypass and terminate modes.
+/// plus the bypass and terminate modes. Bits flow through a 64-bit cache
+/// that is refilled a byte at a time; prefetching never reads past the
+/// payload — only consuming beyond it throws.
 struct CABACDecoder {
     private let bytes: [UInt8]
-    private(set) var bitPosition: Int
+    private let totalBits: Int
+    private var cache: UInt64 = 0
+    private var cacheBits = 0
+    private var loadedBits: Int
     private var range = 510
     private var offset = 0
+
+    /// The bit position of the next unconsumed bit (diagnostics).
+    var bitPosition: Int {
+        loadedBits - cacheBits
+    }
 
     /// Starts decoding at a byte-aligned bit position in the slice RBSP
     /// (the position after the slice header's alignment bits).
     init(bytes: [UInt8], startingAtBit bit: Int) throws {
         self.bytes = bytes
-        self.bitPosition = bit
+        self.totalBits = bytes.count * 8
+        self.loadedBits = bit
         offset = try readBits(9)
         guard offset < 510 else {
             throw ImageError.invalidData(reason: "Invalid HEVC CABAC initialization")
@@ -117,13 +128,21 @@ struct CABACDecoder {
     }
 
     /// Decodes `count` bypass bins as an unsigned value, first bin most
-    /// significant.
+    /// significant. The bypass recurrence with a constant range collapses
+    /// into one division: after n bins the value is ⌊(offset·2ⁿ + bits) / range⌋
+    /// and the remainder is the new offset.
     mutating func decodeBypassBits(_ count: Int) throws -> Int {
-        var value = 0
-        for _ in 0..<count {
-            value = value << 1 | (try decodeBypass())
+        guard count > 0 else { return 0 }
+        guard count <= 32 else {
+            let high = try decodeBypassBits(count - 32)
+            return high << 32 | (try decodeBypassBits(32))
         }
-        return value
+        let expanded = offset << count | (try readBits(count))
+        offset = expanded % range
+        // Valid streams keep offset < range, making the mask a no-op; on
+        // corrupt data it keeps the result bounded like the bin-by-bin
+        // loop did.
+        return (expanded / range) & ((1 << count) - 1)
     }
 
     /// Decodes an end-of-slice / end-of-substream terminate bin.
@@ -137,27 +156,43 @@ struct CABACDecoder {
     }
 
     private mutating func renormalize() throws {
-        while range < 256 {
-            range <<= 1
-            offset = offset << 1 | (try readBit())
+        if range >= 256 {
+            return
+        }
+        // Doublings until the range is back at 9 bits (≥ 256).
+        let shift = range.leadingZeroBitCount - (Int.bitWidth - 9)
+        range <<= shift
+        offset = offset << shift | (try readBits(shift))
+    }
+
+    private mutating func fill() {
+        while cacheBits <= 56, loadedBits < totalBits {
+            cache = cache << 8 | UInt64(bytes[loadedBits >> 3])
+            cacheBits += 8
+            loadedBits += 8
         }
     }
 
     private mutating func readBit() throws -> Int {
-        let byteIndex = bitPosition >> 3
-        guard byteIndex < bytes.count else {
-            throw ImageError.invalidData(reason: "HEVC CABAC data ended early")
+        if cacheBits == 0 {
+            fill()
+            guard cacheBits > 0 else {
+                throw ImageError.invalidData(reason: "HEVC CABAC data ended early")
+            }
         }
-        let bit = Int(bytes[byteIndex] >> (7 - (bitPosition & 7))) & 1
-        bitPosition += 1
-        return bit
+        cacheBits -= 1
+        return Int((cache >> UInt64(cacheBits)) & 1)
     }
 
     private mutating func readBits(_ count: Int) throws -> Int {
-        var value = 0
-        for _ in 0..<count {
-            value = value << 1 | (try readBit())
+        guard count > 0 else { return 0 }
+        if cacheBits < count {
+            fill()
+            guard cacheBits >= count else {
+                throw ImageError.invalidData(reason: "HEVC CABAC data ended early")
+            }
         }
-        return value
+        cacheBits -= count
+        return Int((cache >> UInt64(cacheBits)) & ((1 << UInt64(count)) - 1))
     }
 }

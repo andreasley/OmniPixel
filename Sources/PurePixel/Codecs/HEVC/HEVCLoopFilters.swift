@@ -45,33 +45,35 @@ enum HEVCLoopFilters {
 
         // Transform-block edges on the 8×8 (luma) / chroma 8×8 grid; the
         // coding and prediction edges always coincide with transform edges
-        // in intra pictures.
-        var lumaVertical = Set<Int>()
-        var lumaHorizontal = Set<Int>()
-        var chromaVertical = Set<Int>()
-        var chromaHorizontal = Set<Int>()
+        // in intra pictures. Each edge segment belongs to exactly one block
+        // (its own left/top edge), so plain lists need no deduplication,
+        // and segments within one pass are independent, so order is free.
+        var lumaVertical: [Int] = []
+        var lumaHorizontal: [Int] = []
+        var chromaVertical: [Int] = []
+        var chromaHorizontal: [Int] = []
         for block in picture.transformBlocks {
             let size = 1 << block.log2Size
             if block.componentIndex == 0 {
                 if block.x > 0, block.x & 7 == 0 {
                     for y in stride(from: block.y, to: block.y + size, by: 4) {
-                        lumaVertical.insert((block.x << 16) | y)
+                        lumaVertical.append((block.x << 16) | y)
                     }
                 }
                 if block.y > 0, block.y & 7 == 0 {
                     for x in stride(from: block.x, to: block.x + size, by: 4) {
-                        lumaHorizontal.insert((x << 16) | block.y)
+                        lumaHorizontal.append((x << 16) | block.y)
                     }
                 }
             } else if block.componentIndex == 1 {
                 if block.x > 0, block.x & 7 == 0 {
                     for y in stride(from: block.y, to: block.y + size, by: 4) {
-                        chromaVertical.insert((block.x << 16) | y)
+                        chromaVertical.append((block.x << 16) | y)
                     }
                 }
                 if block.y > 0, block.y & 7 == 0 {
                     for x in stride(from: block.x, to: block.x + size, by: 4) {
-                        chromaHorizontal.insert((x << 16) | block.y)
+                        chromaHorizontal.append((x << 16) | block.y)
                     }
                 }
             }
@@ -79,7 +81,7 @@ enum HEVCLoopFilters {
 
         // Luma: all vertical edges across the picture first, then all
         // horizontal edges, in 4-line segments.
-        for key in lumaVertical.sorted() {
+        for key in lumaVertical {
             let x = key >> 16, y = key & 0xFFFF
             filterLumaSegment(
                 &planes.luma, width: planes.lumaWidth,
@@ -88,7 +90,7 @@ enum HEVCLoopFilters {
                 betaOffset: picture.betaOffset, tcOffset: picture.tcOffset
             )
         }
-        for key in lumaHorizontal.sorted() {
+        for key in lumaHorizontal {
             let x = key >> 16, y = key & 0xFFFF
             filterLumaSegment(
                 &planes.luma, width: planes.lumaWidth,
@@ -102,7 +104,7 @@ enum HEVCLoopFilters {
         // marked edge is filtered.
         let chromaWidth = planes.chromaWidth
         func filterChromaPlane(_ plane: inout [UInt8], qpOffset: Int) {
-            for key in chromaVertical.sorted() {
+            for key in chromaVertical {
                 let x = key >> 16, y = key & 0xFFFF
                 let qp = (lumaQP(2 * x - 1, 2 * y) + lumaQP(2 * x, 2 * y) + 1) >> 1
                 filterChromaSegment(
@@ -112,7 +114,7 @@ enum HEVCLoopFilters {
                     tcOffset: picture.tcOffset
                 )
             }
-            for key in chromaHorizontal.sorted() {
+            for key in chromaHorizontal {
                 let x = key >> 16, y = key & 0xFFFF
                 let qp = (lumaQP(2 * x, 2 * y - 1) + lumaQP(2 * x, 2 * y) + 1) >> 1
                 filterChromaSegment(
@@ -241,71 +243,80 @@ enum HEVCLoopFilters {
         picture: HEVCPictureData,
         sps: HEVCSequenceParameterSet
     ) {
-        // SAO reads the deblocked picture, so it works from a snapshot.
-        let sourceLuma = planes.luma
-        let sourceCb = planes.cb
-        let sourceCr = planes.cr
+        // SAO reads the deblocked picture, so each plane is filtered from a
+        // snapshot into its destination directly.
+        applySAOPlane(&planes.luma, width: planes.lumaWidth, height: planes.lumaHeight,
+                      component: 0, picture: picture, sps: sps)
+        applySAOPlane(&planes.cb, width: planes.chromaWidth, height: planes.chromaHeight,
+                      component: 1, picture: picture, sps: sps)
+        applySAOPlane(&planes.cr, width: planes.chromaWidth, height: planes.chromaHeight,
+                      component: 2, picture: picture, sps: sps)
+    }
+
+    private static func applySAOPlane(
+        _ plane: inout [UInt8], width: Int, height: Int,
+        component: Int,
+        picture: HEVCPictureData,
+        sps: HEVCSequenceParameterSet
+    ) {
+        // Skip the snapshot when no CTB filters this component at all.
+        guard picture.sao.contains(where: { $0.typeIndex[component] != 0 }) else {
+            return
+        }
+        let source = plane
+        let shift = component == 0 ? 0 : 1
 
         for ctbY in 0..<sps.ctbRows {
             for ctbX in 0..<sps.ctbColumns {
                 let parameters = picture.sao[ctbY * sps.ctbColumns + ctbX]
-                for component in 0..<3 {
-                    guard parameters.typeIndex[component] != 0 else { continue }
-                    let shift = component == 0 ? 0 : 1
-                    let width = component == 0 ? planes.lumaWidth : planes.chromaWidth
-                    let height = component == 0 ? planes.lumaHeight : planes.chromaHeight
-                    let source = component == 0 ? sourceLuma : (component == 1 ? sourceCb : sourceCr)
-                    let x0 = (ctbX << sps.log2CTBSize) >> shift
-                    let y0 = (ctbY << sps.log2CTBSize) >> shift
-                    let x1 = min(x0 + (sps.ctbSize >> shift), width)
-                    let y1 = min(y0 + (sps.ctbSize >> shift), height)
+                guard parameters.typeIndex[component] != 0 else { continue }
+                let x0 = (ctbX << sps.log2CTBSize) >> shift
+                let y0 = (ctbY << sps.log2CTBSize) >> shift
+                let x1 = min(x0 + (sps.ctbSize >> shift), width)
+                let y1 = min(y0 + (sps.ctbSize >> shift), height)
 
-                    var updated: [(Int, UInt8)] = []
-                    if parameters.typeIndex[component] == 1 {
-                        // Band offset: four consecutive bands from the band
-                        // position, wrapping at 32.
-                        var bandOffsets = [Int](repeating: 0, count: 32)
-                        for k in 0..<4 {
-                            bandOffsets[(parameters.bandPosition[component] + k) & 31] = parameters.offsets[component][k]
-                        }
-                        for y in y0..<y1 {
-                            for x in x0..<x1 {
-                                let value = Int(source[y * width + x])
-                                let offset = bandOffsets[value >> 3]
-                                if offset != 0 {
-                                    updated.append((y * width + x, UInt8(min(max(value + offset, 0), 255))))
-                                }
-                            }
-                        }
-                    } else {
-                        // Edge offset: compare against the two neighbours
-                        // along the class direction.
-                        let directions = [((-1, 0), (1, 0)), ((0, -1), (0, 1)), ((-1, -1), (1, 1)), ((1, -1), (-1, 1))]
-                        let (first, second) = directions[parameters.eoClass[component]]
-                        for y in y0..<y1 {
-                            for x in x0..<x1 {
-                                let ax = x + first.0, ay = y + first.1
-                                let bx = x + second.0, by = y + second.1
-                                guard ax >= 0, ay >= 0, ax < width, ay < height,
-                                      bx >= 0, by >= 0, bx < width, by < height else {
-                                    continue
-                                }
-                                let value = Int(source[y * width + x])
-                                let a = Int(source[ay * width + ax])
-                                let b = Int(source[by * width + bx])
-                                let edgeIndex = 2 + (value > a ? 1 : (value < a ? -1 : 0)) + (value > b ? 1 : (value < b ? -1 : 0))
-                                guard edgeIndex != 2 else { continue }
-                                let offset = parameters.offsets[component][edgeIndex < 2 ? edgeIndex : edgeIndex - 1]
-                                if offset != 0 {
-                                    updated.append((y * width + x, UInt8(min(max(value + offset, 0), 255))))
-                                }
+                if parameters.typeIndex[component] == 1 {
+                    // Band offset: four consecutive bands from the band
+                    // position, wrapping at 32.
+                    var bandOffsets = [Int](repeating: 0, count: 32)
+                    for k in 0..<4 {
+                        bandOffsets[(parameters.bandPosition[component] + k) & 31] = parameters.offsets[component][k]
+                    }
+                    for y in y0..<y1 {
+                        let rowBase = y * width
+                        for x in x0..<x1 {
+                            let value = Int(source[rowBase + x])
+                            let offset = bandOffsets[value >> 3]
+                            if offset != 0 {
+                                plane[rowBase + x] = UInt8(min(max(value + offset, 0), 255))
                             }
                         }
                     }
-                    switch component {
-                    case 0: for (index, value) in updated { planes.luma[index] = value }
-                    case 1: for (index, value) in updated { planes.cb[index] = value }
-                    default: for (index, value) in updated { planes.cr[index] = value }
+                } else {
+                    // Edge offset: compare against the two neighbours along
+                    // the class direction; samples whose neighbours fall
+                    // outside the picture are left unfiltered.
+                    let directions = [((-1, 0), (1, 0)), ((0, -1), (0, 1)), ((-1, -1), (1, 1)), ((1, -1), (-1, 1))]
+                    let (first, second) = directions[parameters.eoClass[component]]
+                    for y in y0..<y1 {
+                        let rowBase = y * width
+                        for x in x0..<x1 {
+                            let ax = x + first.0, ay = y + first.1
+                            let bx = x + second.0, by = y + second.1
+                            guard ax >= 0, ay >= 0, ax < width, ay < height,
+                                  bx >= 0, by >= 0, bx < width, by < height else {
+                                continue
+                            }
+                            let value = Int(source[rowBase + x])
+                            let a = Int(source[ay * width + ax])
+                            let b = Int(source[by * width + bx])
+                            let edgeIndex = 2 + (value > a ? 1 : (value < a ? -1 : 0)) + (value > b ? 1 : (value < b ? -1 : 0))
+                            guard edgeIndex != 2 else { continue }
+                            let offset = parameters.offsets[component][edgeIndex < 2 ? edgeIndex : edgeIndex - 1]
+                            if offset != 0 {
+                                plane[rowBase + x] = UInt8(min(max(value + offset, 0), 255))
+                            }
+                        }
                     }
                 }
             }

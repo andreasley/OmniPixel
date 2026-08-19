@@ -14,6 +14,19 @@ struct HEVCReconstructedPlanes {
 }
 
 enum HEVCReconstruction {
+    /// Working buffers sized for the largest transform block, allocated
+    /// once per picture and reused for every block.
+    private struct Scratch {
+        var prediction = [Int](repeating: 0, count: 1024)
+        var residual = [Int](repeating: 0, count: 1024)
+        var dequantized = [Int](repeating: 0, count: 1024)
+        var intermediate = [Int](repeating: 0, count: 1024)
+        var accumulator = [Int](repeating: 0, count: 32)
+        var left = [Int](repeating: -1, count: 64)
+        var top = [Int](repeating: -1, count: 64)
+        var reference = [Int](repeating: 0, count: 3 * 32 + 2)
+    }
+
     static func reconstruct(
         picture: HEVCPictureData,
         sps: HEVCSequenceParameterSet,
@@ -37,6 +50,7 @@ enum HEVCReconstruction {
         // order, so the masks realize the z-scan availability rule.
         var lumaMask = ReconstructionMask(width: sps.width, height: sps.height)
         var chromaMask = ReconstructionMask(width: sps.width >> 1, height: sps.height >> 1)
+        var scratch = Scratch()
 
         for block in picture.transformBlocks {
             let size = 1 << block.log2Size
@@ -44,10 +58,9 @@ enum HEVCReconstruction {
             let planeWidth = isLuma ? sps.width : sps.width >> 1
             let planeHeight = isLuma ? sps.height : sps.height >> 1
 
-            var prediction = [Int](repeating: 0, count: size * size)
             withPlane(&planes, component: block.componentIndex) { plane in
                 predictIntra(
-                    into: &prediction,
+                    scratch: &scratch,
                     plane: plane, planeWidth: planeWidth, planeHeight: planeHeight,
                     mask: isLuma ? lumaMask : chromaMask,
                     x: block.x, y: block.y, size: size,
@@ -57,14 +70,24 @@ enum HEVCReconstruction {
                 )
             }
 
-            let residual = residualSamples(for: block, picture: picture, scalingLists: scalingLists)
+            let hasResidual = residualSamples(
+                for: block, picture: picture, scalingLists: scalingLists, scratch: &scratch
+            )
 
             withPlane(&planes, component: block.componentIndex) { plane in
                 for row in 0..<size {
-                    let planeRow = (block.y + row) * planeWidth
-                    for column in 0..<size {
-                        let value = prediction[row * size + column] + residual[row * size + column]
-                        plane[planeRow + block.x + column] = UInt8(min(max(value, 0), 255))
+                    let planeRow = (block.y + row) * planeWidth + block.x
+                    let blockRow = row * size
+                    if hasResidual {
+                        for column in 0..<size {
+                            let value = scratch.prediction[blockRow + column] + scratch.residual[blockRow + column]
+                            plane[planeRow + column] = UInt8(min(max(value, 0), 255))
+                        }
+                    } else {
+                        for column in 0..<size {
+                            let value = scratch.prediction[blockRow + column]
+                            plane[planeRow + column] = UInt8(min(max(value, 0), 255))
+                        }
                     }
                 }
             }
@@ -91,17 +114,23 @@ enum HEVCReconstruction {
 
     // MARK: Residual (dequantization + inverse transform, 8.6)
 
+    /// Fills `scratch.residual` for the block; returns false when the block
+    /// has no coded coefficients (the residual is all zero).
     private static func residualSamples(
         for block: HEVCPictureData.TransformBlock,
         picture: HEVCPictureData,
-        scalingLists: HEVCScalingLists?
-    ) -> [Int] {
-        let size = 1 << block.log2Size
+        scalingLists: HEVCScalingLists?,
+        scratch: inout Scratch
+    ) -> Bool {
         if block.coefficients.isEmpty {
-            return [Int](repeating: 0, count: size * size)
+            return false
         }
+        let size = 1 << block.log2Size
         if block.transquantBypass {
-            return block.coefficients
+            for index in 0..<(size * size) {
+                scratch.residual[index] = block.coefficients[index]
+            }
+            return true
         }
 
         let qp: Int
@@ -114,51 +143,77 @@ enum HEVCReconstruction {
 
         // Intra matrix IDs are the component indices (0 = Y, 1 = Cb, 2 = Cr).
         let scaling = scalingLists?.factors(log2Size: block.log2Size, matrixID: block.componentIndex)
-            ?? [Int](repeating: 16, count: size * size)
-        let levelScale = [40, 45, 51, 57, 64, 72][qp % 6]
+        let levelScale = [40, 45, 51, 57, 64, 72][qp % 6] << (qp / 6)
         let shift = 8 + block.log2Size - 5  // bitDepth + log2(nTbS) − 5
         let rounding = 1 << (shift - 1)
 
-        var dequantized = [Int](repeating: 0, count: size * size)
-        for index in 0..<(size * size) where block.coefficients[index] != 0 {
-            let scaled = block.coefficients[index] * scaling[index] * levelScale << (qp / 6)
-            dequantized[index] = clip16((scaled + rounding) >> shift)
+        for index in 0..<(size * size) {
+            let coefficient = block.coefficients[index]
+            if coefficient == 0 {
+                scratch.dequantized[index] = 0
+            } else {
+                let scaled = coefficient * (scaling?[index] ?? 16) * levelScale
+                scratch.dequantized[index] = clip16((scaled + rounding) >> shift)
+            }
         }
 
         if block.transformSkip {
             // r = (d << 7), then the same final scaling as the second
             // transform stage (8.6.4.1).
-            return dequantized.map { (($0 << 7) + 2048) >> 12 }
+            for index in 0..<(size * size) {
+                scratch.residual[index] = ((scratch.dequantized[index] << 7) + 2048) >> 12
+            }
+            return true
         }
 
         let usesDST = block.componentIndex == 0 && block.log2Size == 2
-        return inverseTransform(dequantized, size: size, usesDST: usesDST)
+        inverseTransform(size: size, usesDST: usesDST, scratch: &scratch)
+        return true
     }
 
     /// Two-stage inverse transform: columns with a 7-bit shift clipped to 16
     /// bits, then rows with the bit-depth shift of 12 (8.6.4.2 for 8-bit).
-    private static func inverseTransform(_ input: [Int], size: Int, usesDST: Bool) -> [Int] {
-        var intermediate = [Int](repeating: 0, count: size * size)
-        for column in 0..<size {
-            for position in 0..<size {
-                var sum = 0
-                for frequency in 0..<size {
-                    sum += input[frequency * size + column] * basis(frequency, position, size, usesDST)
+    /// Both stages scatter-accumulate over the nonzero inputs only, so cost
+    /// scales with the coefficient count rather than the block area.
+    private static func inverseTransform(size: Int, usesDST: Bool, scratch: inout Scratch) {
+        let matrix = usesDST ? dstMatrix : dctMatrices[size.trailingZeroBitCount - 2]
+        let count = size * size
+
+        for index in 0..<count {
+            scratch.intermediate[index] = 0
+        }
+        for frequency in 0..<size {
+            let rowBase = frequency * size
+            let matrixRow = frequency * size
+            for column in 0..<size {
+                let value = scratch.dequantized[rowBase + column]
+                if value == 0 { continue }
+                for position in 0..<size {
+                    scratch.intermediate[position * size + column] += value * matrix[matrixRow + position]
                 }
-                intermediate[position * size + column] = clip16((sum + 64) >> 7)
             }
         }
-        var output = [Int](repeating: 0, count: size * size)
+        for index in 0..<count {
+            scratch.intermediate[index] = clip16((scratch.intermediate[index] + 64) >> 7)
+        }
+
         for row in 0..<size {
+            let rowBase = row * size
             for position in 0..<size {
-                var sum = 0
-                for frequency in 0..<size {
-                    sum += intermediate[row * size + frequency] * basis(frequency, position, size, usesDST)
+                scratch.accumulator[position] = 0
+            }
+            for frequency in 0..<size {
+                let value = scratch.intermediate[rowBase + frequency]
+                if value == 0 { continue }
+                let matrixRow = frequency * size
+                for position in 0..<size {
+                    scratch.accumulator[position] += value * matrix[matrixRow + position]
                 }
-                output[row * size + position] = clip16((sum + 2048) >> 12)
+            }
+            for position in 0..<size {
+                scratch.residual[rowBase + position] = clip16((scratch.accumulator[position] + 2048) >> 12)
             }
         }
-        return output
     }
 
     /// First column of the 32-point transform matrix (H.265 8.6.4.2); every
@@ -169,26 +224,38 @@ enum HEVCReconstruction {
         64, 61, 57, 54, 50, 46, 43, 38, 36, 31, 25, 22, 18, 13, 9, 4, 0,
     ]
 
-    /// The alternative 4×4 transform for intra luma blocks (H.265 8.6.4.1),
-    /// indexed [frequency][position].
-    private static let dstMatrix: [[Int]] = [
-        [29, 55, 74, 84],
-        [74, 74, 0, -74],
-        [84, -29, -74, 55],
-        [55, -84, 74, -29],
-    ]
-
-    private static func basis(_ frequency: Int, _ position: Int, _ size: Int, _ usesDST: Bool) -> Int {
-        if usesDST {
-            return dstMatrix[frequency][position]
+    /// The 4/8/16/32-point matrices expanded once, [frequency·size + position].
+    private static let dctMatrices: [[Int]] = (2...5).map { log2Size in
+        let size = 1 << log2Size
+        var matrix = [Int](repeating: 0, count: size * size)
+        for frequency in 0..<size {
+            for position in 0..<size {
+                // cos(π·frequency·(2·position+1) / (2·size)) in units of π/64.
+                let angle = frequency * (2 * position + 1) * (32 / size) % 128
+                let value: Int
+                if angle <= 32 {
+                    value = cosineTable[angle]
+                } else if angle <= 64 {
+                    value = -cosineTable[64 - angle]
+                } else if angle <= 96 {
+                    value = -cosineTable[angle - 64]
+                } else {
+                    value = cosineTable[128 - angle]
+                }
+                matrix[frequency * size + position] = value
+            }
         }
-        // cos(π·frequency·(2·position+1) / (2·size)) in units of π/64.
-        let angle = frequency * (2 * position + 1) * (32 / size) % 128
-        if angle <= 32 { return cosineTable[angle] }
-        if angle <= 64 { return -cosineTable[64 - angle] }
-        if angle <= 96 { return -cosineTable[angle - 64] }
-        return cosineTable[128 - angle]
+        return matrix
     }
+
+    /// The alternative 4×4 transform for intra luma blocks (H.265 8.6.4.1),
+    /// [frequency·4 + position].
+    private static let dstMatrix: [Int] = [
+        29, 55, 74, 84,
+        74, 74, 0, -74,
+        84, -29, -74, 55,
+        55, -84, 74, -29,
+    ]
 
     private static func clip16(_ value: Int) -> Int {
         min(max(value, -32768), 32767)
@@ -219,7 +286,7 @@ enum HEVCReconstruction {
     ]
 
     private static func predictIntra(
-        into prediction: inout [Int],
+        scratch: inout Scratch,
         plane: [UInt8], planeWidth: Int, planeHeight: Int,
         mask: ReconstructionMask,
         x: Int, y: Int, size: Int,
@@ -229,55 +296,90 @@ enum HEVCReconstruction {
     ) {
         // Gather the reference samples: left[0..2N-1] runs downward from
         // (x-1, y), top[0..2N-1] rightward from (x, y-1), plus the corner.
+        // Availability is constant within each 4-sample group (the mask's
+        // granularity, and block coordinates are 4-aligned), so it is
+        // checked once per group.
         let extent = 2 * size
-        var left = [Int](repeating: -1, count: extent)     // -1 = unavailable
-        var top = [Int](repeating: -1, count: extent)
-        var corner = -1
-
-        func sample(_ sampleX: Int, _ sampleY: Int) -> Int {
-            guard sampleX >= 0, sampleY >= 0, sampleX < planeWidth, sampleY < planeHeight,
-                  mask.isReconstructed(x: sampleX, y: sampleY) else {
-                return -1
-            }
-            return Int(plane[sampleY * planeWidth + sampleX])
-        }
-
         for i in 0..<extent {
-            left[i] = sample(x - 1, y + i)
-            top[i] = sample(x + i, y - 1)
+            scratch.left[i] = -1     // -1 = unavailable
+            scratch.top[i] = -1
         }
-        corner = sample(x - 1, y - 1)
+        var corner = -1
+        var anyAvailable = false
+
+        let leftX = x - 1
+        if leftX >= 0 {
+            let rowLimit = min(extent, planeHeight - y)
+            var i = 0
+            while i < rowLimit {
+                if mask.isReconstructed(x: leftX, y: y + i) {
+                    let end = min(i + 4, rowLimit)
+                    var index = (y + i) * planeWidth + leftX
+                    for j in i..<end {
+                        scratch.left[j] = Int(plane[index])
+                        index += planeWidth
+                    }
+                    anyAvailable = true
+                    i = end
+                } else {
+                    i += 4
+                }
+            }
+        }
+        if y > 0 {
+            let rowBase = (y - 1) * planeWidth
+            let columnLimit = min(extent, planeWidth - x)
+            var i = 0
+            while i < columnLimit {
+                if mask.isReconstructed(x: x + i, y: y - 1) {
+                    let end = min(i + 4, columnLimit)
+                    for j in i..<end {
+                        scratch.top[j] = Int(plane[rowBase + x + j])
+                    }
+                    anyAvailable = true
+                    i = end
+                } else {
+                    i += 4
+                }
+            }
+            if leftX >= 0, mask.isReconstructed(x: leftX, y: y - 1) {
+                corner = Int(plane[rowBase + leftX])
+                anyAvailable = true
+            }
+        }
 
         // Reference substitution (8.4.4.2.2): scan from the bottom-left up
         // and then across; unavailable samples take the previous value.
-        if corner < 0 && !left.contains(where: { $0 >= 0 }) && !top.contains(where: { $0 >= 0 }) {
+        if !anyAvailable {
             let mid = 128  // 1 << (bitDepth - 1)
-            left = [Int](repeating: mid, count: extent)
-            top = [Int](repeating: mid, count: extent)
+            for i in 0..<extent {
+                scratch.left[i] = mid
+                scratch.top[i] = mid
+            }
             corner = mid
         } else {
-            if left[extent - 1] < 0 {
+            if scratch.left[extent - 1] < 0 {
                 var substitute = -1
-                for i in stride(from: extent - 2, through: 0, by: -1) where left[i] >= 0 {
-                    substitute = left[i]
+                for i in stride(from: extent - 2, through: 0, by: -1) where scratch.left[i] >= 0 {
+                    substitute = scratch.left[i]
                     break
                 }
                 if substitute < 0 { substitute = corner }
                 if substitute < 0 {
-                    for i in 0..<extent where top[i] >= 0 {
-                        substitute = top[i]
+                    for i in 0..<extent where scratch.top[i] >= 0 {
+                        substitute = scratch.top[i]
                         break
                     }
                 }
-                left[extent - 1] = substitute
+                scratch.left[extent - 1] = substitute
             }
-            for i in stride(from: extent - 2, through: 0, by: -1) where left[i] < 0 {
-                left[i] = left[i + 1]
+            for i in stride(from: extent - 2, through: 0, by: -1) where scratch.left[i] < 0 {
+                scratch.left[i] = scratch.left[i + 1]
             }
-            if corner < 0 { corner = left[0] }
-            if top[0] < 0 { top[0] = corner }
-            for i in 1..<extent where top[i] < 0 {
-                top[i] = top[i - 1]
+            if corner < 0 { corner = scratch.left[0] }
+            if scratch.top[0] < 0 { scratch.top[0] = corner }
+            for i in 1..<extent where scratch.top[i] < 0 {
+                scratch.top[i] = scratch.top[i - 1]
             }
         }
 
@@ -287,28 +389,32 @@ enum HEVCReconstruction {
             let threshold = size == 8 ? 7 : (size == 16 ? 1 : 0)
             if mode == 0 || distance > threshold {
                 let strong = strongSmoothing && size == 32
-                    && abs(corner + top[extent - 1] - 2 * top[size - 1]) < 8
-                    && abs(corner + left[extent - 1] - 2 * left[size - 1]) < 8
+                    && abs(corner + scratch.top[extent - 1] - 2 * scratch.top[size - 1]) < 8
+                    && abs(corner + scratch.left[extent - 1] - 2 * scratch.left[size - 1]) < 8
                 if strong {
-                    let topEnd = top[extent - 1]
-                    let leftEnd = left[extent - 1]
+                    let topEnd = scratch.top[extent - 1]
+                    let leftEnd = scratch.left[extent - 1]
                     let savedCorner = corner
                     for i in 0..<(extent - 1) {
-                        top[i] = ((63 - (i + 1)) * savedCorner + (i + 1) * topEnd + 32) >> 6
-                        left[i] = ((63 - (i + 1)) * savedCorner + (i + 1) * leftEnd + 32) >> 6
+                        scratch.top[i] = ((63 - (i + 1)) * savedCorner + (i + 1) * topEnd + 32) >> 6
+                        scratch.left[i] = ((63 - (i + 1)) * savedCorner + (i + 1) * leftEnd + 32) >> 6
                     }
                 } else {
-                    var filteredLeft = left
-                    var filteredTop = top
-                    let filteredCorner = (left[0] + 2 * corner + top[0] + 2) >> 2
-                    filteredLeft[0] = (corner + 2 * left[0] + left[1] + 2) >> 2
-                    filteredTop[0] = (corner + 2 * top[0] + top[1] + 2) >> 2
-                    for i in 1..<(extent - 1) {
-                        filteredLeft[i] = (left[i - 1] + 2 * left[i] + left[i + 1] + 2) >> 2
-                        filteredTop[i] = (top[i - 1] + 2 * top[i] + top[i + 1] + 2) >> 2
+                    // [1 2 1] filtering in place, carrying each original
+                    // value into the next tap.
+                    let filteredCorner = (scratch.left[0] + 2 * corner + scratch.top[0] + 2) >> 2
+                    var previous = corner
+                    for i in 0..<(extent - 1) {
+                        let current = scratch.left[i]
+                        scratch.left[i] = (previous + 2 * current + scratch.left[i + 1] + 2) >> 2
+                        previous = current
                     }
-                    left = filteredLeft
-                    top = filteredTop
+                    previous = corner
+                    for i in 0..<(extent - 1) {
+                        let current = scratch.top[i]
+                        scratch.top[i] = (previous + 2 * current + scratch.top[i + 1] + 2) >> 2
+                        previous = current
+                    }
                     corner = filteredCorner
                 }
             }
@@ -318,10 +424,12 @@ enum HEVCReconstruction {
         case 0:  // planar (8.4.4.2.4)
             let log2Size = size.trailingZeroBitCount
             for row in 0..<size {
+                let rowBase = row * size
+                let leftSample = scratch.left[row]
                 for column in 0..<size {
-                    prediction[row * size + column] = (
-                        (size - 1 - column) * left[row] + (column + 1) * top[size]
-                        + (size - 1 - row) * top[column] + (row + 1) * left[size]
+                    scratch.prediction[rowBase + column] = (
+                        (size - 1 - column) * leftSample + (column + 1) * scratch.top[size]
+                        + (size - 1 - row) * scratch.top[column] + (row + 1) * scratch.left[size]
                         + size
                     ) >> (log2Size + 1)
                 }
@@ -329,19 +437,19 @@ enum HEVCReconstruction {
         case 1:  // DC (8.4.4.2.5)
             var sum = size
             for i in 0..<size {
-                sum += left[i] + top[i]
+                sum += scratch.left[i] + scratch.top[i]
             }
             let dc = sum >> (size.trailingZeroBitCount + 1)
             for i in 0..<(size * size) {
-                prediction[i] = dc
+                scratch.prediction[i] = dc
             }
             if isLuma, size < 32 {
-                prediction[0] = (left[0] + 2 * dc + top[0] + 2) >> 2
+                scratch.prediction[0] = (scratch.left[0] + 2 * dc + scratch.top[0] + 2) >> 2
                 for column in 1..<size {
-                    prediction[column] = (top[column] + 3 * dc + 2) >> 2
+                    scratch.prediction[column] = (scratch.top[column] + 3 * dc + 2) >> 2
                 }
                 for row in 1..<size {
-                    prediction[row * size] = (left[row] + 3 * dc + 2) >> 2
+                    scratch.prediction[row * size] = (scratch.left[row] + 3 * dc + 2) >> 2
                 }
             }
         default:  // angular (8.4.4.2.6)
@@ -350,13 +458,16 @@ enum HEVCReconstruction {
             // Main reference: index 0 is the corner, 1… the top row (or the
             // left column for horizontal modes), extended below index 0 via
             // the inverse angle when the angle is negative.
-            var reference = [Int](repeating: 0, count: 3 * size + 2)
             let referenceBase = size
-            let main = vertical ? top : left
-            let side = vertical ? left : top
-            reference[referenceBase] = corner
-            for i in 0..<extent {
-                reference[referenceBase + 1 + i] = main[i]
+            scratch.reference[referenceBase] = corner
+            if vertical {
+                for i in 0..<extent {
+                    scratch.reference[referenceBase + 1 + i] = scratch.top[i]
+                }
+            } else {
+                for i in 0..<extent {
+                    scratch.reference[referenceBase + 1 + i] = scratch.left[i]
+                }
             }
             if angle < 0 {
                 let inverseAngle = inverseAngles[mode - 11]
@@ -364,11 +475,20 @@ enum HEVCReconstruction {
                 if lowest < -1 {
                     for i in stride(from: -1, through: lowest, by: -1) {
                         let sideIndex = ((i * inverseAngle + 128) >> 8) - 1
-                        reference[referenceBase + i] = sideIndex < 0 ? corner : side[min(sideIndex, extent - 1)]
+                        let side: Int
+                        if sideIndex < 0 {
+                            side = corner
+                        } else if vertical {
+                            side = scratch.left[min(sideIndex, extent - 1)]
+                        } else {
+                            side = scratch.top[min(sideIndex, extent - 1)]
+                        }
+                        scratch.reference[referenceBase + i] = side
                     }
                 }
             }
             for row in 0..<size {
+                let rowBase = row * size
                 for column in 0..<size {
                     let position = vertical ? row : column
                     let offset = vertical ? column : row
@@ -377,11 +497,11 @@ enum HEVCReconstruction {
                     let base = referenceBase + 1 + offset + intercept
                     let value: Int
                     if fraction == 0 {
-                        value = reference[base]
+                        value = scratch.reference[base]
                     } else {
-                        value = ((32 - fraction) * reference[base] + fraction * reference[base + 1] + 16) >> 5
+                        value = ((32 - fraction) * scratch.reference[base] + fraction * scratch.reference[base + 1] + 16) >> 5
                     }
-                    prediction[row * size + column] = value
+                    scratch.prediction[rowBase + column] = value
                 }
             }
             // Boundary smoothing for the purely vertical/horizontal modes
@@ -389,13 +509,13 @@ enum HEVCReconstruction {
             if isLuma, size < 32 {
                 if mode == 26 {
                     for row in 0..<size {
-                        let value = top[0] + ((left[row] - corner) >> 1)
-                        prediction[row * size] = min(max(value, 0), 255)
+                        let value = scratch.top[0] + ((scratch.left[row] - corner) >> 1)
+                        scratch.prediction[row * size] = min(max(value, 0), 255)
                     }
                 } else if mode == 10 {
                     for column in 0..<size {
-                        let value = left[0] + ((top[column] - corner) >> 1)
-                        prediction[column] = min(max(value, 0), 255)
+                        let value = scratch.left[0] + ((scratch.top[column] - corner) >> 1)
+                        scratch.prediction[column] = min(max(value, 0), 255)
                     }
                 }
             }

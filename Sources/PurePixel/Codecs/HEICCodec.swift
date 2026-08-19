@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 
 /// HEIC/HEIF (ISO Base Media File Format container with an HEVC payload).
@@ -107,34 +108,42 @@ enum HEICCodec: ImageCodec {
             throw ImageError.invalidData(reason: "HEIC grid expects \(rows * columns) tiles but references \(tileIDs.count)")
         }
 
-        var composite = Image(width: outputWidth, height: outputHeight, fill: .black)
-        var tileWidth = 0
-        var tileHeight = 0
-        for (index, tileID) in tileIDs.enumerated() {
-            let stream = try makeStream(container: container, itemID: tileID)
-            // Orientation and clean-aperture cropping belong to the grid
-            // item; tiles contribute their raw pixels.
-            let tile = try decodeStream(stream, applyOrientation: false)
-            if index == 0 {
-                tileWidth = tile.width
-                tileHeight = tile.height
-                guard columns * tileWidth >= outputWidth, rows * tileHeight >= outputHeight else {
-                    throw ImageError.invalidData(reason: "HEIC grid tiles don't cover the image")
-                }
-            } else {
-                guard tile.width == tileWidth, tile.height == tileHeight else {
-                    throw ImageError.invalidData(reason: "HEIC grid tiles have inconsistent sizes")
-                }
+        // Tiles are independent HEVC pictures; decode them concurrently.
+        // Orientation and clean-aperture cropping belong to the grid item,
+        // so tiles contribute their raw pixels.
+        let streams = try tileIDs.map { try makeStream(container: container, itemID: $0) }
+        var results = [Result<Image, Error>?](repeating: nil, count: streams.count)
+        results.withUnsafeMutableBufferPointer { buffer in
+            nonisolated(unsafe) let output = buffer
+            DispatchQueue.concurrentPerform(iterations: streams.count) { index in
+                output[index] = Result { try decodeStream(streams[index], applyOrientation: false) }
             }
+        }
+        let tiles = try results.map { try $0!.get() }
+
+        let tileWidth = tiles[0].width
+        let tileHeight = tiles[0].height
+        guard columns * tileWidth >= outputWidth, rows * tileHeight >= outputHeight else {
+            throw ImageError.invalidData(reason: "HEIC grid tiles don't cover the image")
+        }
+        guard tiles.allSatisfy({ $0.width == tileWidth && $0.height == tileHeight }) else {
+            throw ImageError.invalidData(reason: "HEIC grid tiles have inconsistent sizes")
+        }
+
+        var compositePixels = [RGBA](repeating: .black, count: outputWidth * outputHeight)
+        for (index, tile) in tiles.enumerated() {
             let originX = (index % columns) * tileWidth
             let originY = (index / columns) * tileHeight
             guard originX < outputWidth, originY < outputHeight else { continue }
+            let copyWidth = min(tileWidth, outputWidth - originX)
             for y in 0..<min(tileHeight, outputHeight - originY) {
-                for x in 0..<min(tileWidth, outputWidth - originX) {
-                    composite[originX + x, originY + y] = tile[x, y]
-                }
+                let source = y * tileWidth
+                let destination = (originY + y) * outputWidth + originX
+                compositePixels[destination..<destination + copyWidth] =
+                    tile.pixels[source..<source + copyWidth]
             }
         }
+        let composite = Image(width: outputWidth, height: outputHeight, pixels: compositePixels)
 
         var rotation = 0
         if let irot = container.property(ofType: "irot", forItem: gridID), let first = irot.first {
@@ -162,67 +171,82 @@ enum HEICCodec: ImageCodec {
         default: (kr, kb) = (0.299, 0.114)
         }
 
+        // Chroma reaches the matrix at ×8 (bilinear quarters × halves), so
+        // the coefficients carry a ÷8; limited range folds in the 255/224
+        // chroma and 255/219 luma expansions.
+        let chromaScale = (stream.fullRange ? 1.0 : 255.0 / 224.0) * 65536.0 / 8.0
+        let greenWeight = 1 - kr - kb
+        let crToRed = Int((2 * (1 - kr) * chromaScale).rounded())
+        let cbToBlue = Int((2 * (1 - kb) * chromaScale).rounded())
+        let crToGreen = Int((2 * (1 - kr) * kr / greenWeight * chromaScale).rounded())
+        let cbToGreen = Int((2 * (1 - kb) * kb / greenWeight * chromaScale).rounded())
+        var lumaTable = [Int](repeating: 0, count: 256)
+        for value in 0..<256 {
+            let scaled = stream.fullRange ? Double(value) : (Double(value) - 16) * 255 / 219
+            lumaTable[value] = Int((scaled * 65536).rounded())
+        }
+
         var pixels = [RGBA](repeating: .transparent, count: stream.displayWidth * stream.displayHeight)
         let chromaWidth = planes.chromaWidth
 
         // Chroma sampling must stay inside the display window: the coded
         // picture is padded with arbitrary samples that must not bleed into
         // the visible edge pixels.
-        let chromaMinX = stream.displayLeft >> 1
         let chromaMaxX = (stream.displayLeft + stream.displayWidth - 1) >> 1
         let chromaMinY = stream.displayTop >> 1
         let chromaMaxY = (stream.displayTop + stream.displayHeight - 1) >> 1
 
+        var cbRow = [Int](repeating: 0, count: stream.displayWidth)
+        var crRow = [Int](repeating: 0, count: stream.displayWidth)
+
         for row in 0..<stream.displayHeight {
             let lumaY = row + stream.displayTop
+            // Chroma rows sit midway between the two luma rows they cover:
+            // luma row y maps to chroma position (2y − 1)/4, blended in
+            // quarters between the enclosing chroma rows.
+            let position4 = 2 * lumaY - 1
+            let topRow = min(max(position4 >> 2, chromaMinY), chromaMaxY)
+            let bottomRow = min(topRow + 1, chromaMaxY)
+            let weight4 = min(max(position4 - 4 * topRow, 0), 4)
+            let topBase = topRow * chromaWidth
+            let bottomBase = bottomRow * chromaWidth
+
             for column in 0..<stream.displayWidth {
                 let lumaX = column + stream.displayLeft
-                let y = Double(planes.luma[lumaY * planes.lumaWidth + lumaX])
-
-                // Bilinear chroma upsampling for default 4:2:0 siting.
-                func chroma(_ plane: [UInt8]) -> Double {
-                    let baseX = lumaX >> 1
-                    let horizontal: Double = lumaX & 1 == 0 ? 0 : 0.5
-                    // Chroma rows sit midway between the two luma rows they
-                    // cover: luma row 2r maps to chroma position r − 0.25.
-                    let position = Double(lumaY) / 2 - 0.25
-                    let topRow = min(max(Int(position.rounded(.down)), chromaMinY), chromaMaxY)
-                    let bottomRow = min(topRow + 1, chromaMaxY)
-                    let verticalWeight = min(max(position - Double(topRow), 0), 1)
-
-                    func sampleRow(_ chromaRow: Int) -> Double {
-                        let left = Double(plane[chromaRow * chromaWidth + baseX])
-                        guard horizontal > 0 else { return left }
-                        let right = Double(plane[chromaRow * chromaWidth + min(baseX + 1, chromaMaxX)])
-                        return left * (1 - horizontal) + right * horizontal
-                    }
-                    return sampleRow(topRow) * (1 - verticalWeight) + sampleRow(bottomRow) * verticalWeight
-                }
-                let cb = chroma(planes.cb)
-                let cr = chroma(planes.cr)
-
-                let yScaled: Double
-                let cbScaled: Double
-                let crScaled: Double
-                if stream.fullRange {
-                    yScaled = y
-                    cbScaled = cb - 128
-                    crScaled = cr - 128
+                let baseX = lumaX >> 1
+                let leftCb = (4 - weight4) * Int(planes.cb[topBase + baseX])
+                    + weight4 * Int(planes.cb[bottomBase + baseX])
+                let leftCr = (4 - weight4) * Int(planes.cr[topBase + baseX])
+                    + weight4 * Int(planes.cr[bottomBase + baseX])
+                if lumaX & 1 == 0 {
+                    cbRow[column] = leftCb * 2
+                    crRow[column] = leftCr * 2
                 } else {
-                    yScaled = (y - 16) * 255 / 219
-                    cbScaled = (cb - 128) * 255 / 224
-                    crScaled = (cr - 128) * 255 / 224
+                    // Odd columns sit halfway to the next chroma sample.
+                    let rightX = min(baseX + 1, chromaMaxX)
+                    cbRow[column] = leftCb
+                        + (4 - weight4) * Int(planes.cb[topBase + rightX])
+                        + weight4 * Int(planes.cb[bottomBase + rightX])
+                    crRow[column] = leftCr
+                        + (4 - weight4) * Int(planes.cr[topBase + rightX])
+                        + weight4 * Int(planes.cr[bottomBase + rightX])
                 }
+            }
 
-                let red = yScaled + 2 * (1 - kr) * crScaled
-                let blue = yScaled + 2 * (1 - kb) * cbScaled
-                let green = (yScaled - kr * red - kb * blue) / (1 - kr - kb)
-
-                func clip(_ value: Double) -> UInt8 {
-                    UInt8(min(max(value.rounded(), 0), 255))
-                }
-                pixels[row * stream.displayWidth + column] = RGBA(
-                    red: clip(red), green: clip(green), blue: clip(blue), alpha: 255
+            let lumaRowBase = lumaY * planes.lumaWidth + stream.displayLeft
+            let pixelRowBase = row * stream.displayWidth
+            for column in 0..<stream.displayWidth {
+                let luma = lumaTable[Int(planes.luma[lumaRowBase + column])]
+                let cb8 = cbRow[column] - 1024  // 128 × 8
+                let cr8 = crRow[column] - 1024
+                let red = (luma + crToRed * cr8 + 32768) >> 16
+                let green = (luma - cbToGreen * cb8 - crToGreen * cr8 + 32768) >> 16
+                let blue = (luma + cbToBlue * cb8 + 32768) >> 16
+                pixels[pixelRowBase + column] = RGBA(
+                    red: UInt8(min(max(red, 0), 255)),
+                    green: UInt8(min(max(green, 0), 255)),
+                    blue: UInt8(min(max(blue, 0), 255)),
+                    alpha: 255
                 )
             }
         }

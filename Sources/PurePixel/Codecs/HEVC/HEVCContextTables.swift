@@ -65,7 +65,17 @@ struct HEVCContextSet {
 /// Coefficient scan order generation (ITU-T H.265 section 6.5.3):
 /// 0 = up-right diagonal, 1 = horizontal, 2 = vertical.
 enum HEVCScan {
+    /// All orders the decoder ever needs (sizes 1, 2, 4, 8 × 3 scans),
+    /// generated once — residual decoding asks for two per transform block.
+    private static let cache: [[[(x: Int, y: Int)]]] = (0...3).map { log2Size in
+        (0...2).map { generate(size: 1 << log2Size, scan: $0) }
+    }
+
     static func order(size: Int, scan: Int) -> [(x: Int, y: Int)] {
+        cache[size.trailingZeroBitCount][scan]
+    }
+
+    private static func generate(size: Int, scan: Int) -> [(x: Int, y: Int)] {
         switch scan {
         case 1:  // horizontal: row by row
             var result: [(x: Int, y: Int)] = []
