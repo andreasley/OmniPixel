@@ -93,6 +93,16 @@ Everything that can fail throws `ImageError`:
 
 Decoders never crash on malformed input: all reads are bounds-checked, sizes are sanity-capped, and arithmetic is overflow-checked.
 
+## Demo app
+
+The package includes **PurePixelViewer**, a small SwiftUI image viewer for macOS that exercises the library end to end: it opens any supported format (file picker or drag & drop), decodes it with PurePixel's own codecs, shows the detected format and EXIF metadata, offers rotation, mirroring, scaling and cropping, and re-encodes to any writable format (with a JPEG quality slider) for export. The platform frameworks are only used to draw the finished pixels.
+
+```sh
+swift run PurePixelViewer
+```
+
+On non-Apple platforms the executable builds but just prints a note — the viewer's interface is SwiftUI.
+
 ## What's missing
 
 Known gaps, all reported as explicit `unsupportedFeature` errors where they apply:
