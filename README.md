@@ -47,7 +47,7 @@ canvas[5, 5] = RGBA(red: 255, green: 0, blue: 0)
 | **BMP** | 8-bit palette, 24-bit and 32-bit uncompressed, top-down and bottom-up | 24-bit uncompressed |
 | **QOI** | Complete | Complete |
 | **PPM/PGM** | Binary (P5/P6), including 16-bit samples | Binary PPM |
-| **HEIC** | Full pure-Swift HEVC intra decoder: 4:2:0 streams incl. wavefront parallel processing, delta-QP, SAO and deblocking, `colr` color conversion (BT.601/709/2020, limited/full range), `irot`/`imir` orientation, odd sizes via clean aperture | — |
+| **HEIC** | Full pure-Swift HEVC intra decoder: 4:2:0 streams incl. wavefront parallel processing, delta-QP, SAO and deblocking, **grid (tiled) images**, `colr` color conversion (BT.601/709/2020, limited/full range), `irot`/`imir` orientation, odd sizes via clean aperture | — |
 
 Format detection is automatic in `Image(data:)`, or available separately via `ImageFormat(detecting: data)`.
 
@@ -107,7 +107,7 @@ On non-Apple platforms the executable builds but just prints a note — the view
 
 Known gaps, all reported as explicit `unsupportedFeature` errors where they apply:
 
-- **HEIC**: encoding (requires an H.265 encoder); 4:4:4 chroma (produced by Apple encoders at quality 1.0 — use ≤ 0.95), grid (tiled) images, tiles, PCM, dependent slices and explicit scaling lists. The intra decoder was validated sample-exactly against a reference HEVC decoder; the final RGB output can differ from other decoders by small amounts because chroma upsampling filters are not standardized. AVIF (AV1) is not supported.
+- **HEIC**: encoding (requires an H.265 encoder); 4:4:4 chroma (produced by Apple encoders at quality 1.0 — use ≤ 0.95), HEVC tiles, PCM, dependent slices and explicit scaling lists. The intra decoder was validated sample-exactly against a reference HEVC decoder; the final RGB output can differ from other decoders by small amounts because chroma upsampling filters are not standardized. AVIF (AV1) is not supported.
 - **Lossy and animated WebP** (VP8 coding; only lossless VP8L is supported).
 - **Animated GIF** beyond the first frame (no multi-frame API yet).
 - **JPEG**: arithmetic coding, 12-bit precision, lossless/hierarchical modes (all rare in practice).

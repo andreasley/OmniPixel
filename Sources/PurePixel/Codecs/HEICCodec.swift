@@ -34,22 +34,117 @@ enum HEICCodec: ImageCodec {
     }
 
     static func decode(_ data: Data) throws -> Image {
-        let stream = try parseStream(from: data)
+        guard canDecode(data) else {
+            throw ImageError.invalidData(reason: "Missing HEIF file type box")
+        }
+        let container = try HEIFContainer(bytes: [UInt8](data))
+        guard let primaryID = container.primaryItemID else {
+            throw ImageError.invalidData(reason: "HEIC has no primary item")
+        }
+        if container.itemTypes[primaryID] == "grid" {
+            return try decodeGrid(container: container, gridID: primaryID)
+        }
+        let stream = try makeStream(container: container, itemID: primaryID)
+        return try decodeStream(stream)
+    }
+
+    /// Runs the full HEVC pipeline for one coded item.
+    private static func decodeStream(_ stream: HEVCStream, applyOrientation: Bool = true) throws -> Image {
         let decoder = try HEVCPictureDecoder(sps: stream.sps, pps: stream.pps)
         let picture = try decoder.decodePicture(sliceNALUnits: stream.sliceNALUnits)
         var planes = HEVCReconstruction.reconstruct(picture: picture, sps: stream.sps)
         HEVCLoopFilters.apply(to: &planes, picture: picture, sps: stream.sps)
 
         var image = convertToRGB(planes, stream: stream)
-        if stream.rotationQuarterTurns > 0 {
+        if applyOrientation {
+            image = oriented(image, quarterTurns: stream.rotationQuarterTurns, mirrorAxis: stream.mirrorAxis)
+        }
+        return image
+    }
+
+    private static func oriented(_ image: Image, quarterTurns: Int, mirrorAxis: Int?) -> Image {
+        var image = image
+        if quarterTurns > 0 {
             // irot counts 90° anti-clockwise turns.
-            let rotation: Rotation = [.clockwise270, .clockwise180, .clockwise90][stream.rotationQuarterTurns - 1]
+            let rotation: Rotation = [.clockwise270, .clockwise180, .clockwise90][quarterTurns - 1]
             image = image.rotated(by: rotation)
         }
-        if let axis = stream.mirrorAxis {
+        if let axis = mirrorAxis {
             image = image.mirrored(across: axis == 0 ? .horizontal : .vertical)
         }
         return image
+    }
+
+    /// Decodes a tiled image: the primary `grid` item declares the layout
+    /// and output size, and `dimg` references list the coded tiles in
+    /// row-major order (ISO 23008-12 section 6.6.2.3).
+    private static func decodeGrid(container: HEIFContainer, gridID: Int) throws -> Image {
+        guard let payload = try container.itemData(for: gridID), payload.count >= 8 else {
+            throw ImageError.invalidData(reason: "Corrupt HEIC grid configuration")
+        }
+        let rows = Int(payload[2]) + 1
+        let columns = Int(payload[3]) + 1
+        let fieldSize = payload[1] & 1 == 1 ? 4 : 2
+        guard payload.count >= 4 + 2 * fieldSize else {
+            throw ImageError.invalidData(reason: "Corrupt HEIC grid configuration")
+        }
+        func dimension(at offset: Int) -> Int {
+            var value = 0
+            for i in 0..<fieldSize {
+                value = value << 8 | Int(payload[offset + i])
+            }
+            return value
+        }
+        let outputWidth = dimension(at: 4)
+        let outputHeight = dimension(at: 4 + fieldSize)
+        let (pixelCount, overflow) = outputWidth.multipliedReportingOverflow(by: outputHeight)
+        guard outputWidth > 0, outputHeight > 0, !overflow, pixelCount <= Image.maxPixelCount else {
+            throw ImageError.invalidData(reason: "Invalid HEIC grid dimensions")
+        }
+
+        let tileIDs = container.linkedItems(ofType: "dimg", from: gridID)
+        guard tileIDs.count == rows * columns else {
+            throw ImageError.invalidData(reason: "HEIC grid expects \(rows * columns) tiles but references \(tileIDs.count)")
+        }
+
+        var composite = Image(width: outputWidth, height: outputHeight, fill: .black)
+        var tileWidth = 0
+        var tileHeight = 0
+        for (index, tileID) in tileIDs.enumerated() {
+            let stream = try makeStream(container: container, itemID: tileID)
+            // Orientation and clean-aperture cropping belong to the grid
+            // item; tiles contribute their raw pixels.
+            let tile = try decodeStream(stream, applyOrientation: false)
+            if index == 0 {
+                tileWidth = tile.width
+                tileHeight = tile.height
+                guard columns * tileWidth >= outputWidth, rows * tileHeight >= outputHeight else {
+                    throw ImageError.invalidData(reason: "HEIC grid tiles don't cover the image")
+                }
+            } else {
+                guard tile.width == tileWidth, tile.height == tileHeight else {
+                    throw ImageError.invalidData(reason: "HEIC grid tiles have inconsistent sizes")
+                }
+            }
+            let originX = (index % columns) * tileWidth
+            let originY = (index / columns) * tileHeight
+            guard originX < outputWidth, originY < outputHeight else { continue }
+            for y in 0..<min(tileHeight, outputHeight - originY) {
+                for x in 0..<min(tileWidth, outputWidth - originX) {
+                    composite[originX + x, originY + y] = tile[x, y]
+                }
+            }
+        }
+
+        var rotation = 0
+        if let irot = container.property(ofType: "irot", forItem: gridID), let first = irot.first {
+            rotation = Int(first & 0x03)
+        }
+        var mirror: Int?
+        if let imir = container.property(ofType: "imir", forItem: gridID), let first = imir.first {
+            mirror = Int(first & 0x01)
+        }
+        return oriented(composite, quarterTurns: rotation, mirrorAxis: mirror)
     }
 
     /// Crops the coded planes to the display window and converts YCbCr to
@@ -176,12 +271,18 @@ enum HEICCodec: ImageCodec {
         guard let primaryID = container.primaryItemID else {
             throw ImageError.invalidData(reason: "HEIC has no primary item")
         }
-        let primaryType = container.itemTypes[primaryID]
-        if primaryType == "grid" {
-            throw ImageError.unsupportedFeature(reason: "Grid (tiled) HEIC is not supported yet")
+        if container.itemTypes[primaryID] == "grid" {
+            throw ImageError.invalidData(reason: "HEIC grid items contain multiple HEVC streams; decode the file instead")
         }
+        return try makeStream(container: container, itemID: primaryID)
+    }
+
+    /// Builds the decodable stream for one coded (`hvc1`) item, using the
+    /// properties associated with that item.
+    private static func makeStream(container: HEIFContainer, itemID primaryID: Int) throws -> HEVCStream {
+        let primaryType = container.itemTypes[primaryID]
         guard primaryType == "hvc1" else {
-            throw ImageError.unsupportedFeature(reason: "HEIF primary item type '\(primaryType ?? "?")' is not supported")
+            throw ImageError.unsupportedFeature(reason: "HEIF item type '\(primaryType ?? "?")' is not supported")
         }
 
         guard let configPayload = container.property(ofType: "hvcC", forItem: primaryID) else {
@@ -359,6 +460,7 @@ private struct HEIFContainer {
     private(set) var itemLocations: [Int: ItemLocation] = [:]
     private(set) var properties: [(type: String, payload: [UInt8])] = []
     private(set) var associations: [Int: [Int]] = [:]
+    private(set) var references: [(type: String, from: Int, to: [Int])] = []
     private(set) var idat: [UInt8] = []
     private let bytes: [UInt8]
 
@@ -370,7 +472,9 @@ private struct HEIFContainer {
     // MARK: Lookups
 
     /// Returns the payload of the first property of `type` associated with
-    /// the item (falling back to a global search for lenient parsing).
+    /// the item. Only items without any association entry fall back to a
+    /// global search (lenient parsing for single-image files) — in tiled
+    /// images, one item's properties must not leak onto another's.
     func property(ofType type: String, forItem itemID: Int) -> [UInt8]? {
         if let indices = associations[itemID] {
             for index in indices where index >= 1 && index <= properties.count {
@@ -378,8 +482,15 @@ private struct HEIFContainer {
                     return properties[index - 1].payload
                 }
             }
+            return nil
         }
         return properties.first { $0.type == type }?.payload
+    }
+
+    /// Item IDs referenced from `itemID` with the given reference type
+    /// (for example the `dimg` tiles of a grid), in declaration order.
+    func linkedItems(ofType type: String, from itemID: Int) -> [Int] {
+        references.filter { $0.type == type && $0.from == itemID }.flatMap(\.to)
     }
 
     /// Assembles an item's data from its iloc extents.
@@ -477,6 +588,8 @@ private struct HEIFContainer {
                 }
             case ("meta", "iloc"):
                 try parseItemLocations(payloadStart, payloadEnd)
+            case ("meta", "iref"):
+                try parseItemReferences(payloadStart, payloadEnd)
             case ("meta", "iprp"):
                 try walkBoxes(from: payloadStart, to: payloadEnd, container: "iprp", depth: depth + 1)
             case ("meta", "idat"):
@@ -580,6 +693,53 @@ private struct HEIFContainer {
                 location.extents.append((extentOffset, extentLength))
             }
             itemLocations[itemID] = location
+        }
+    }
+
+    /// iref: a full box containing one reference box per link type, each
+    /// listing a source item and the items it references. Item IDs are
+    /// 16-bit in version 0 and 32-bit in version 1.
+    private mutating func parseItemReferences(_ start: Int, _ end: Int) throws {
+        guard start + 4 <= end else {
+            throw ImageError.invalidData(reason: "Corrupt HEIF item reference box")
+        }
+        let wideIDs = bytes[start] >= 1
+        var offset = start + 4
+        while offset + 8 <= end {
+            let size = try readU32(offset)
+            guard size >= 8, offset + size <= end else {
+                throw ImageError.invalidData(reason: "Corrupt HEIF item reference box")
+            }
+            let type = String(decoding: bytes[offset + 4..<offset + 8], as: UTF8.self)
+            var cursor = offset + 8
+            let fromID: Int
+            if wideIDs {
+                fromID = try readU32(cursor)
+                cursor += 4
+            } else {
+                fromID = try readU16(cursor)
+                cursor += 2
+            }
+            let referenceCount = try readU16(cursor)
+            cursor += 2
+            guard referenceCount <= 4096 else {
+                throw ImageError.invalidData(reason: "Unreasonable HEIF reference count")
+            }
+            var targets: [Int] = []
+            for _ in 0..<referenceCount {
+                if wideIDs {
+                    targets.append(try readU32(cursor))
+                    cursor += 4
+                } else {
+                    targets.append(try readU16(cursor))
+                    cursor += 2
+                }
+            }
+            guard cursor <= offset + size else {
+                throw ImageError.invalidData(reason: "Corrupt HEIF item reference box")
+            }
+            references.append((type, fromID, targets))
+            offset += size
         }
     }
 

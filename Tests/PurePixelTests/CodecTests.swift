@@ -984,8 +984,9 @@ import UniformTypeIdentifiers
         // Smooth content minimizes the difference from ImageIO's chroma
         // resampling filter, isolating our decode + color conversion; the
         // underlying YUV planes are validated sample-exactly against a
-        // reference decoder during bring-up.
-        for (width, height) in [(64, 48), (51, 37), (128, 96)] {
+        // reference decoder during bring-up. At 1024×768 the encoder
+        // produces a grid (tiled) image, covering the tile compositor.
+        for (width, height) in [(64, 48), (51, 37), (128, 96), (1024, 768)] {
             var pixelData = [UInt8](repeating: 255, count: width * height * 4)
             for y in 0..<height {
                 for x in 0..<width {
@@ -1014,6 +1015,11 @@ import UniformTypeIdentifiers
             ] as CFDictionary)
             #expect(CGImageDestinationFinalize(destination))
             let data = output as Data
+
+            if width >= 1024 {
+                // Make sure the tiled path is actually exercised.
+                #expect(data.range(of: Data("grid".utf8)) != nil, "expected the encoder to produce a grid image")
+            }
 
             let mine = try Image(data: data)
             let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
