@@ -1,3 +1,150 @@
+/// Quantization scaling matrices (ITU-T H.265 sections 7.3.4 and 7.4.5):
+/// per transform size and matrix ID, at full block resolution in raster
+/// order. Sizes 16 and 32 are coded as an 8×8 base matrix plus a DC value
+/// and upsampled here.
+struct HEVCScalingLists {
+    /// [log2Size − 2][matrixID][y·size + x]. Matrix IDs 0–2 are intra
+    /// Y/Cb/Cr, 3–5 inter; 32×32 has only the two luma matrices.
+    private var scalingFactors: [[[Int]]]
+
+    func factors(log2Size: Int, matrixID: Int) -> [Int] {
+        let matrices = scalingFactors[log2Size - 2]
+        return matrices[min(matrixID, matrices.count - 1)]
+    }
+
+    static let flat4: [Int] = [Int](repeating: 16, count: 16)
+    static let defaultIntra8: [Int] = [
+        16, 16, 16, 16, 17, 18, 21, 24,
+        16, 16, 16, 16, 17, 19, 22, 25,
+        16, 16, 17, 18, 20, 22, 25, 29,
+        16, 16, 18, 21, 24, 27, 31, 36,
+        17, 17, 20, 24, 30, 35, 41, 47,
+        18, 19, 22, 27, 35, 44, 54, 65,
+        21, 22, 25, 31, 41, 54, 70, 88,
+        24, 25, 29, 36, 47, 65, 88, 115,
+    ]
+    static let defaultInter8: [Int] = [
+        16, 16, 16, 16, 17, 18, 20, 24,
+        16, 16, 16, 17, 18, 20, 24, 25,
+        16, 16, 17, 18, 20, 24, 25, 28,
+        16, 17, 18, 20, 24, 25, 28, 33,
+        17, 18, 20, 24, 25, 28, 33, 41,
+        18, 20, 24, 25, 28, 33, 41, 54,
+        20, 24, 25, 28, 33, 41, 54, 71,
+        24, 25, 28, 33, 41, 54, 71, 91,
+    ]
+
+    private static func defaultBase(sizeID: Int, matrixID: Int) -> [Int] {
+        if sizeID == 0 {
+            return flat4
+        }
+        return matrixID < 3 ? defaultIntra8 : defaultInter8
+    }
+
+    private init(scalingFactors: [[[Int]]]) {
+        self.scalingFactors = scalingFactors
+    }
+
+    /// The specification's default matrices (used when scaling lists are
+    /// enabled without explicit data).
+    static let defaults: HEVCScalingLists = {
+        var bases: [[[Int]]] = []
+        var dcs: [[Int]] = []
+        for sizeID in 0..<4 {
+            let count = sizeID == 3 ? 2 : 6
+            bases.append((0..<count).map { defaultBase(sizeID: sizeID, matrixID: sizeID == 3 ? $0 * 3 : $0) })
+            dcs.append([Int](repeating: 16, count: count))
+        }
+        return HEVCScalingLists(scalingFactors: deriveFactors(bases: bases, dcValues: dcs))
+    }()
+
+    /// Parses scaling_list_data (7.3.4).
+    init(reader: inout HEVCBitReader) throws {
+        var bases: [[[Int]]] = []
+        var dcValues: [[Int]] = []
+        for sizeID in 0..<4 {
+            let matrixCount = sizeID == 3 ? 2 : 6
+            var sizeBases: [[Int]] = []
+            var sizeDCs: [Int] = []
+            for matrixIndex in 0..<matrixCount {
+                let matrixID = sizeID == 3 ? matrixIndex * 3 : matrixIndex
+                if try reader.readFlag() == false {
+                    // Predicted: delta 0 selects the default matrix, other
+                    // values copy an earlier matrix of the same size.
+                    let delta = try reader.readUnsignedExpGolomb()
+                    if delta == 0 {
+                        sizeBases.append(Self.defaultBase(sizeID: sizeID, matrixID: matrixID))
+                        sizeDCs.append(16)
+                    } else {
+                        let reference = matrixIndex - delta
+                        guard reference >= 0 else {
+                            throw ImageError.invalidData(reason: "Invalid HEVC scaling list reference")
+                        }
+                        sizeBases.append(sizeBases[reference])
+                        sizeDCs.append(sizeDCs[reference])
+                    }
+                } else {
+                    // Explicit: delta-coded coefficients in up-right
+                    // diagonal order over the base matrix.
+                    var nextCoefficient = 8
+                    var dc = 16
+                    if sizeID > 1 {
+                        dc = 8 + (try reader.readSignedExpGolomb())
+                        guard (1...255).contains(dc) else {
+                            throw ImageError.invalidData(reason: "Invalid HEVC scaling list DC value")
+                        }
+                        nextCoefficient = dc
+                    }
+                    let baseSize = sizeID == 0 ? 4 : 8
+                    let scan = HEVCScan.order(size: baseSize, scan: 0)
+                    var base = [Int](repeating: 0, count: baseSize * baseSize)
+                    for i in 0..<(baseSize * baseSize) {
+                        let delta = try reader.readSignedExpGolomb()
+                        nextCoefficient = (nextCoefficient + delta + 256) % 256
+                        guard nextCoefficient > 0 else {
+                            throw ImageError.invalidData(reason: "Invalid HEVC scaling list coefficient")
+                        }
+                        base[scan[i].y * baseSize + scan[i].x] = nextCoefficient
+                    }
+                    sizeBases.append(base)
+                    sizeDCs.append(dc)
+                }
+            }
+            bases.append(sizeBases)
+            dcValues.append(sizeDCs)
+        }
+        scalingFactors = Self.deriveFactors(bases: bases, dcValues: dcValues)
+    }
+
+    /// Expands base matrices to full-resolution factors (7.4.5): 4×4 and
+    /// 8×8 directly; 16×16 and 32×32 upsample the 8×8 base 2×/4× and take
+    /// their DC entry from the coded DC value.
+    private static func deriveFactors(bases: [[[Int]]], dcValues: [[Int]]) -> [[[Int]]] {
+        var result: [[[Int]]] = []
+        for sizeID in 0..<4 {
+            var matrices: [[Int]] = []
+            for (index, base) in bases[sizeID].enumerated() {
+                if sizeID < 2 {
+                    matrices.append(base)
+                    continue
+                }
+                let size = sizeID == 2 ? 16 : 32
+                let shift = sizeID == 2 ? 1 : 2
+                var factors = [Int](repeating: 0, count: size * size)
+                for y in 0..<size {
+                    for x in 0..<size {
+                        factors[y * size + x] = base[(y >> shift) * 8 + (x >> shift)]
+                    }
+                }
+                factors[0] = dcValues[sizeID][index]
+                matrices.append(factors)
+            }
+            result.append(matrices)
+        }
+        return result
+    }
+}
+
 /// H.265 sequence parameter set — the fields a still-picture decoder needs
 /// (ITU-T H.265 section 7.3.2.2).
 struct HEVCSequenceParameterSet {
@@ -21,6 +168,7 @@ struct HEVCSequenceParameterSet {
     var maxTransformHierarchyDepthInter = 0
     var maxTransformHierarchyDepthIntra = 0
     var scalingListEnabled = false
+    var scalingLists: HEVCScalingLists?
     var ampEnabled = false
     var saoEnabled = false
     var pcmEnabled = false
@@ -99,8 +247,7 @@ struct HEVCSequenceParameterSet {
 
         sps.scalingListEnabled = try reader.readFlag()
         if sps.scalingListEnabled, try reader.readFlag() {
-            // Dequantization only implements the default scaling matrices.
-            throw ImageError.unsupportedFeature(reason: "HEVC streams with explicit scaling lists are not supported yet")
+            sps.scalingLists = try HEVCScalingLists(reader: &reader)
         }
         sps.ampEnabled = try reader.readFlag()
         sps.saoEnabled = try reader.readFlag()
@@ -177,6 +324,7 @@ struct HEVCPictureParameterSet {
     var initQP = 26
     var constrainedIntraPrediction = false
     var transformSkipEnabled = false
+    var scalingLists: HEVCScalingLists?
     var cuQPDeltaEnabled = false
     var diffCUQPDeltaDepth = 0
     var cbQPOffset = 0
@@ -251,7 +399,7 @@ struct HEVCPictureParameterSet {
             }
         }
         if try reader.readFlag() {  // pps_scaling_list_data_present_flag
-            throw ImageError.unsupportedFeature(reason: "HEVC picture-level scaling lists are not supported yet")
+            pps.scalingLists = try HEVCScalingLists(reader: &reader)
         }
         _ = try reader.readFlag()  // lists_modification_present_flag
         pps.log2ParallelMergeLevel = 2 + (try reader.readUnsignedExpGolomb())

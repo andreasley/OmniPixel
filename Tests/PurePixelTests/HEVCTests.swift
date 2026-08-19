@@ -248,7 +248,7 @@ import UniformTypeIdentifiers
         let stream = try HEICCodec.parseStream(from: data)
         let decoder = try HEVCPictureDecoder(sps: stream.sps, pps: stream.pps)
         let picture = try decoder.decodePicture(sliceNALUnits: stream.sliceNALUnits)
-        let planes = HEVCReconstruction.reconstruct(picture: picture, sps: stream.sps)
+        let planes = HEVCReconstruction.reconstruct(picture: picture, sps: stream.sps, pps: stream.pps)
 
         #expect(planes.luma.count == stream.sps.width * stream.sps.height)
         #expect(planes.cb.count == planes.chromaWidth * planes.chromaHeight)
@@ -282,11 +282,153 @@ import UniformTypeIdentifiers
             let stream = try HEICCodec.parseStream(from: data)
             let decoder = try HEVCPictureDecoder(sps: stream.sps, pps: stream.pps)
             let picture = try decoder.decodePicture(sliceNALUnits: stream.sliceNALUnits)
-            let planes = HEVCReconstruction.reconstruct(picture: picture, sps: stream.sps)
+            let planes = HEVCReconstruction.reconstruct(picture: picture, sps: stream.sps, pps: stream.pps)
             #expect(planes.luma.count == stream.sps.width * stream.sps.height)
             // Content is not flat, so the reconstruction should not be either.
             #expect(Set(planes.luma).count > 16)
         }
+    }
+
+    @Test func decodesExplicitScalingLists() throws {
+        // VideoToolbox never writes explicit scaling lists, so splice
+        // crafted scaling_list_data into a real SPS at the bit level: flip
+        // sps_scaling_list_data_present_flag from 0 to 1 and insert list
+        // data covering all three coding paths (explicit coefficients,
+        // copy-by-delta, default-by-delta-zero). The slice data parses
+        // unchanged; only dequantization differs. The result was verified
+        // sample-exactly against a reference decoder during bring-up.
+        let data = try makeHEIC(width: 64, height: 48, quality: 0.5)
+        let stream = try HEICCodec.parseStream(from: data)
+
+        // Locate the SPS NAL and the bit position of the present flag by
+        // mirroring the parser's field order.
+        let spsNAL = try #require(findParameterNAL(ofType: 33, in: data))
+        let payload = HEVCNALUnit(bytes: spsNAL)!.payload
+        var reader = HEVCBitReader(payload)
+        _ = try reader.readBits(8)  // vps id, sublayers, nesting
+        _ = try reader.readBits(96)  // profile_tier_level (no sublayers)
+        _ = try reader.readUnsignedExpGolomb()  // sps id
+        let chroma = try reader.readUnsignedExpGolomb()
+        try #require(chroma != 3)
+        _ = try reader.readUnsignedExpGolomb()  // width
+        _ = try reader.readUnsignedExpGolomb()  // height
+        if try reader.readFlag() {
+            for _ in 0..<4 { _ = try reader.readUnsignedExpGolomb() }
+        }
+        for _ in 0..<3 { _ = try reader.readUnsignedExpGolomb() }  // depths, poc
+        let orderingPresent = try reader.readFlag()
+        try #require(orderingPresent || !orderingPresent)  // one sub-layer either way
+        for _ in 0..<3 { _ = try reader.readUnsignedExpGolomb() }
+        for _ in 0..<6 { _ = try reader.readUnsignedExpGolomb() }  // block sizes
+        try #require(try reader.readFlag())  // scaling_list_enabled
+        let presentFlagPosition = reader.bitPosition
+        try #require(try reader.readFlag() == false)
+
+        // scaling_list_data: explicit flat-24 luma 4×4 (DC 30 at 16×16,
+        // 24 at 32×32), chroma copied from luma, inter lists defaulted.
+        var lists = TestBitWriter()
+        for sizeID in 0..<4 {
+            for matrixIndex in 0..<(sizeID == 3 ? 2 : 6) {
+                switch (sizeID, matrixIndex) {
+                case (0, 0), (1, 0), (2, 0), (3, 0):
+                    lists.bit(1)
+                    var next = 8
+                    if sizeID > 1 {
+                        let dc = sizeID == 2 ? 30 : 24
+                        lists.signedExpGolomb(dc - 8)
+                        next = dc
+                    }
+                    let target = [24, 20, 20, 18][sizeID]
+                    for i in 0..<min(64, 1 << (4 + (sizeID << 1))) {
+                        lists.signedExpGolomb(i == 0 ? target - next : 0)
+                    }
+                case (0, 1), (0, 2):
+                    lists.bit(0)
+                    lists.unsignedExpGolomb(matrixIndex)  // copy luma
+                case (1, 2), (2, 2), (3, 1):
+                    lists.bit(0)
+                    lists.unsignedExpGolomb(1)  // copy previous
+                default:
+                    lists.bit(0)
+                    lists.unsignedExpGolomb(0)  // default list
+                }
+            }
+        }
+
+        // Reassemble the payload with the flag flipped and the data inserted.
+        var outBits: [Bool] = []
+        var copier = HEVCBitReader(payload)
+        for _ in 0..<presentFlagPosition { outBits.append(try copier.readBit() == 1) }
+        _ = try copier.readBit()
+        outBits.append(true)
+        outBits.append(contentsOf: lists.bits)
+        for _ in (presentFlagPosition + 1)..<(payload.count * 8) {
+            outBits.append(try copier.readBit() == 1)
+        }
+        while outBits.count % 8 != 0 { outBits.append(false) }
+        var newPayload = [UInt8]()
+        for byteIndex in stride(from: 0, to: outBits.count, by: 8) {
+            var byte = 0
+            for i in 0..<8 { byte = byte << 1 | (outBits[byteIndex + i] ? 1 : 0) }
+            newPayload.append(UInt8(byte))
+        }
+        var escaped: [UInt8] = [spsNAL[0], spsNAL[1]]
+        var zeroRun = 0
+        for byte in newPayload {
+            if zeroRun >= 2, byte <= 3 {
+                escaped.append(3)
+                zeroRun = 0
+            }
+            escaped.append(byte)
+            zeroRun = byte == 0 ? zeroRun + 1 : 0
+        }
+
+        let scaledSPS = try HEVCSequenceParameterSet.parse(try #require(HEVCNALUnit(bytes: escaped)))
+        let parsed = try #require(scaledSPS.scalingLists)
+        #expect(parsed.factors(log2Size: 2, matrixID: 0) == [Int](repeating: 24, count: 16))
+        #expect(parsed.factors(log2Size: 2, matrixID: 1)[7] == 24)   // copied from luma
+        #expect(parsed.factors(log2Size: 3, matrixID: 0)[0] == 20)   // explicit
+        #expect(parsed.factors(log2Size: 3, matrixID: 1)[0] == 16)   // default list
+        #expect(parsed.factors(log2Size: 3, matrixID: 1)[63] == 115) // default list tail
+        #expect(parsed.factors(log2Size: 4, matrixID: 0)[0] == 30)   // explicit DC
+        #expect(parsed.factors(log2Size: 4, matrixID: 0)[1] == 20)
+        #expect(parsed.factors(log2Size: 5, matrixID: 0)[0] == 24)   // explicit DC
+
+        // Decoding with the explicit lists must succeed and produce pixels
+        // different from the default-list decode of the same slice data.
+        func decode(with sps: HEVCSequenceParameterSet) throws -> [UInt8] {
+            let decoder = try HEVCPictureDecoder(sps: sps, pps: stream.pps)
+            let picture = try decoder.decodePicture(sliceNALUnits: stream.sliceNALUnits)
+            var planes = HEVCReconstruction.reconstruct(picture: picture, sps: sps, pps: stream.pps)
+            HEVCLoopFilters.apply(to: &planes, picture: picture, sps: sps)
+            return planes.luma
+        }
+        let scaledLuma = try decode(with: scaledSPS)
+        let defaultLuma = try decode(with: stream.sps)
+        #expect(scaledLuma != defaultLuma)
+    }
+
+    private func findParameterNAL(ofType type: Int, in data: Data) -> [UInt8]? {
+        let bytes = [UInt8](data)
+        for i in 0..<(bytes.count - 4)
+        where bytes[i] == 0x68 && bytes[i+1] == 0x76 && bytes[i+2] == 0x63 && bytes[i+3] == 0x43 {
+            let arrayCount = Int(bytes[i + 4 + 22])
+            var offset = i + 4 + 23
+            for _ in 0..<arrayCount {
+                let unitCount = Int(bytes[offset + 1]) << 8 | Int(bytes[offset + 2])
+                offset += 3
+                for _ in 0..<unitCount {
+                    let length = Int(bytes[offset]) << 8 | Int(bytes[offset + 1])
+                    offset += 2
+                    let nal = Array(bytes[offset..<offset + length])
+                    if Int(nal[0] >> 1) & 0x3F == type {
+                        return nal
+                    }
+                    offset += length
+                }
+            }
+        }
+        return nil
     }
 
     @Test func parsesRealHEVCStreamAtOddDimensions() throws {
@@ -310,6 +452,31 @@ import UniformTypeIdentifiers
 /// probability tables, so it validates the engine logic (renormalization,
 /// outstanding-bit handling, state adaptation), while the tables themselves
 /// are covered by spot checks and, end to end, by conformance decoding.
+/// MSB-first bit assembly with Exp-Golomb coding, for building test
+/// bitstream fragments.
+private struct TestBitWriter {
+    var bits: [Bool] = []
+
+    mutating func bit(_ value: Int) {
+        bits.append(value == 1)
+    }
+
+    mutating func unsignedExpGolomb(_ value: Int) {
+        let coded = value + 1
+        let length = coded.bitWidth - coded.leadingZeroBitCount
+        for _ in 0..<(length - 1) {
+            bit(0)
+        }
+        for i in stride(from: length - 1, through: 0, by: -1) {
+            bit((coded >> i) & 1)
+        }
+    }
+
+    mutating func signedExpGolomb(_ value: Int) {
+        unsignedExpGolomb(value > 0 ? 2 * value - 1 : -2 * value)
+    }
+}
+
 private struct TestCABACEncoder {
     private var low = 0
     private var range = 510

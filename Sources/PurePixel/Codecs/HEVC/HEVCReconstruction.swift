@@ -16,8 +16,14 @@ struct HEVCReconstructedPlanes {
 enum HEVCReconstruction {
     static func reconstruct(
         picture: HEVCPictureData,
-        sps: HEVCSequenceParameterSet
+        sps: HEVCSequenceParameterSet,
+        pps: HEVCPictureParameterSet
     ) -> HEVCReconstructedPlanes {
+        // Picture-level scaling lists override sequence-level ones; enabled
+        // streams without explicit lists use the default matrices.
+        let scalingLists: HEVCScalingLists? = sps.scalingListEnabled
+            ? (pps.scalingLists ?? sps.scalingLists ?? .defaults)
+            : nil
         var planes = HEVCReconstructedPlanes(
             lumaWidth: sps.width,
             lumaHeight: sps.height,
@@ -51,7 +57,7 @@ enum HEVCReconstruction {
                 )
             }
 
-            let residual = residualSamples(for: block, picture: picture, sps: sps)
+            let residual = residualSamples(for: block, picture: picture, scalingLists: scalingLists)
 
             withPlane(&planes, component: block.componentIndex) { plane in
                 for row in 0..<size {
@@ -88,7 +94,7 @@ enum HEVCReconstruction {
     private static func residualSamples(
         for block: HEVCPictureData.TransformBlock,
         picture: HEVCPictureData,
-        sps: HEVCSequenceParameterSet
+        scalingLists: HEVCScalingLists?
     ) -> [Int] {
         let size = 1 << block.log2Size
         if block.coefficients.isEmpty {
@@ -106,7 +112,9 @@ enum HEVCReconstruction {
             qp = chromaQP(fromLumaQP: block.qp, offset: offset)
         }
 
-        let scaling = scalingFactors(log2Size: block.log2Size, enabled: sps.scalingListEnabled)
+        // Intra matrix IDs are the component indices (0 = Y, 1 = Cb, 2 = Cr).
+        let scaling = scalingLists?.factors(log2Size: block.log2Size, matrixID: block.componentIndex)
+            ?? [Int](repeating: 16, count: size * size)
         let levelScale = [40, 45, 51, 57, 64, 72][qp % 6]
         let shift = 8 + block.log2Size - 5  // bitDepth + log2(nTbS) − 5
         let rounding = 1 << (shift - 1)
@@ -184,46 +192,6 @@ enum HEVCReconstruction {
 
     private static func clip16(_ value: Int) -> Int {
         min(max(value, -32768), 32767)
-    }
-
-    // MARK: Scaling lists (7.4.5, Table 7-5/7-6)
-
-    /// Default intra scaling matrix for 8×8 blocks; 16×16 and 32×32 use it
-    /// upsampled 2×/4× with the DC entry replaced by 16.
-    private static let defaultIntraScaling8: [Int] = [
-        16, 16, 16, 16, 17, 18, 21, 24,
-        16, 16, 16, 16, 17, 19, 22, 25,
-        16, 16, 17, 18, 20, 22, 25, 29,
-        16, 16, 18, 21, 24, 27, 31, 36,
-        17, 17, 20, 24, 30, 35, 41, 47,
-        18, 19, 22, 27, 35, 44, 54, 65,
-        21, 22, 25, 31, 41, 54, 70, 88,
-        24, 25, 29, 36, 47, 65, 88, 115,
-    ]
-
-    private static let scalingCache: [[Int]] = (2...5).map { log2Size in
-        let size = 1 << log2Size
-        if log2Size == 2 {
-            return [Int](repeating: 16, count: 16)
-        }
-        let shift = log2Size - 3  // upsampling factor from the 8×8 matrix
-        var factors = [Int](repeating: 0, count: size * size)
-        for y in 0..<size {
-            for x in 0..<size {
-                factors[y * size + x] = defaultIntraScaling8[(y >> shift) * 8 + (x >> shift)]
-            }
-        }
-        if log2Size > 3 {
-            factors[0] = 16  // default DC value
-        }
-        return factors
-    }
-
-    private static func scalingFactors(log2Size: Int, enabled: Bool) -> [Int] {
-        guard enabled else {
-            return [Int](repeating: 16, count: 1 << (log2Size << 1))
-        }
-        return scalingCache[log2Size - 2]
     }
 
     // MARK: Chroma QP (8.6.1, Table 8-10 for 4:2:0)

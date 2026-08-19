@@ -52,7 +52,7 @@ enum HEICCodec: ImageCodec {
     private static func decodeStream(_ stream: HEVCStream, applyOrientation: Bool = true) throws -> Image {
         let decoder = try HEVCPictureDecoder(sps: stream.sps, pps: stream.pps)
         let picture = try decoder.decodePicture(sliceNALUnits: stream.sliceNALUnits)
-        var planes = HEVCReconstruction.reconstruct(picture: picture, sps: stream.sps)
+        var planes = HEVCReconstruction.reconstruct(picture: picture, sps: stream.sps, pps: stream.pps)
         HEVCLoopFilters.apply(to: &planes, picture: picture, sps: stream.sps)
 
         var image = convertToRGB(planes, stream: stream)
