@@ -902,9 +902,10 @@ import UniformTypeIdentifiers
 
     // MARK: HEIC
 
-    @Test func heicIsRecognizedButReportsMissingHEVCDecoder() throws {
+    @Test func heicWithoutImageItemIsRejected() throws {
         // Hand-built minimal HEIF: an ftyp box with the heic brand and a
-        // meta/iprp/ipco/ispe chain declaring 100×50 pixels.
+        // meta/iprp/ipco/ispe chain, but no primary item or image data —
+        // detected as HEIC, rejected as malformed.
         var writer = ByteWriter()
         writer.writeUInt32BigEndian(20)  // ftyp box
         writer.writeBytes(Array("ftypheic".utf8))
@@ -925,9 +926,7 @@ import UniformTypeIdentifiers
 
         let data = writer.data
         #expect(ImageFormat(detecting: data) == .heic)
-        #expect(throws: ImageError.unsupportedFeature(
-            reason: "HEIC decoding requires an HEVC (H.265) decoder, which is not implemented (image is 100×50)"
-        )) {
+        #expect(throws: ImageError.invalidData(reason: "HEIC has no primary item")) {
             _ = try Image(data: data)
         }
     }
@@ -966,12 +965,88 @@ import UniformTypeIdentifiers
 
         let data = output as Data
         #expect(ImageFormat(detecting: data) == .heic)
-        do {
-            _ = try Image(data: data)
-            Issue.record("Decoding a HEIC should have thrown")
-        } catch let ImageError.unsupportedFeature(reason) {
-            #expect(reason.contains("HEVC"))
-            #expect(reason.contains("64×48"))
+        let image = try Image(data: data)
+        #expect(image.width == 64)
+        #expect(image.height == 48)
+        // Solid (200,200,200) content should survive the lossy round trip
+        // closely everywhere.
+        for y in stride(from: 0, to: 48, by: 5) {
+            for x in stride(from: 0, to: 64, by: 5) {
+                let pixel = image[x, y]
+                #expect(abs(Int(pixel.red) - 200) <= 6)
+                #expect(abs(Int(pixel.green) - 200) <= 6)
+                #expect(abs(Int(pixel.blue) - 200) <= 6)
+            }
+        }
+    }
+
+    @Test func heicDecodeMatchesImageIO() throws {
+        // Smooth content minimizes the difference from ImageIO's chroma
+        // resampling filter, isolating our decode + color conversion; the
+        // underlying YUV planes are validated sample-exactly against a
+        // reference decoder during bring-up.
+        for (width, height) in [(64, 48), (51, 37), (128, 96)] {
+            var pixelData = [UInt8](repeating: 255, count: width * height * 4)
+            for y in 0..<height {
+                for x in 0..<width {
+                    let i = (y * width + x) * 4
+                    pixelData[i] = UInt8(min(255, x + y / 2))
+                    pixelData[i + 1] = UInt8(255 - min(255, x + y / 2))
+                    pixelData[i + 2] = UInt8(min(255, x + y / 2))
+                }
+            }
+            let context = try #require(CGContext(
+                data: &pixelData,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ))
+            let cgImage = try #require(context.makeImage())
+            let output = NSMutableData()
+            let destination = try #require(CGImageDestinationCreateWithData(
+                output, UTType.heic.identifier as CFString, 1, nil
+            ))
+            CGImageDestinationAddImage(destination, cgImage, [
+                kCGImageDestinationLossyCompressionQuality: 0.9,
+            ] as CFDictionary)
+            #expect(CGImageDestinationFinalize(destination))
+            let data = output as Data
+
+            let mine = try Image(data: data)
+            let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+            let referenceImage = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+            #expect(mine.width == referenceImage.width)
+            #expect(mine.height == referenceImage.height)
+
+            var reference = [UInt8](repeating: 0, count: mine.width * mine.height * 4)
+            let referenceContext = try #require(CGContext(
+                data: &reference,
+                width: mine.width,
+                height: mine.height,
+                bitsPerComponent: 8,
+                bytesPerRow: mine.width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ))
+            referenceContext.draw(referenceImage, in: CGRect(x: 0, y: 0, width: mine.width, height: mine.height))
+
+            var sumSquared = 0.0
+            for y in 0..<mine.height {
+                for x in 0..<mine.width {
+                    let pixel = mine[x, y]
+                    let i = (y * mine.width + x) * 4
+                    for (a, b) in [(pixel.red, reference[i]), (pixel.green, reference[i + 1]), (pixel.blue, reference[i + 2])] {
+                        let diff = Double(Int(a) - Int(b))
+                        sumSquared += diff * diff
+                    }
+                }
+            }
+            let mse = sumSquared / Double(mine.width * mine.height * 3)
+            let psnr = mse == 0 ? 99 : 10 * log10(255.0 * 255.0 / mse)
+            #expect(psnr > 40, "PSNR \(psnr) too low for \(width)×\(height)")
         }
     }
     #endif

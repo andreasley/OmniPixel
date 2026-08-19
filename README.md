@@ -2,7 +2,7 @@
 
 A cross-platform image library written entirely in Swift. It reads and writes the common image formats, converts between them, and offers basic editing — with **zero dependencies** beyond Foundation's `Data`, so the same code runs on macOS, iOS and Linux.
 
-PurePixel is built for correctness and safety rather than raw speed: every decoder is bounds-checked and throws typed errors on malformed input, all public types are value types and `Sendable`, and the compression layers (DEFLATE, two LZW dialects, VP8L, JPEG entropy coding) are implemented from scratch in Swift. Output is routinely validated against Apple's ImageIO and zlib in the test suite.
+PurePixel is built for correctness and safety rather than raw speed: every decoder is bounds-checked and throws typed errors on malformed input, all public types are value types and `Sendable`, and the compression layers (DEFLATE, two LZW dialects, VP8L, JPEG entropy coding, HEVC CABAC) are implemented from scratch in Swift. Output is routinely validated against Apple's ImageIO and zlib in the test suite.
 
 ## Quick start
 
@@ -47,7 +47,7 @@ canvas[5, 5] = RGBA(red: 255, green: 0, blue: 0)
 | **BMP** | 8-bit palette, 24-bit and 32-bit uncompressed, top-down and bottom-up | 24-bit uncompressed |
 | **QOI** | Complete | Complete |
 | **PPM/PGM** | Binary (P5/P6), including 16-bit samples | Binary PPM |
-| **HEIC** | Detected and container-parsed only — see below | — |
+| **HEIC** | Full pure-Swift HEVC intra decoder: 4:2:0 streams incl. wavefront parallel processing, delta-QP, SAO and deblocking, `colr` color conversion (BT.601/709/2020, limited/full range), `irot`/`imir` orientation, odd sizes via clean aperture | — |
 
 Format detection is automatic in `Image(data:)`, or available separately via `ImageFormat(detecting: data)`.
 
@@ -97,7 +97,7 @@ Decoders never crash on malformed input: all reads are bounds-checked, sizes are
 
 Known gaps, all reported as explicit `unsupportedFeature` errors where they apply:
 
-- **HEIC pixels.** The container is parsed (files are recognized and the error message even reports the image dimensions), but the payload is HEVC (H.265) video coding — a from-scratch decoder is a very large project and is not currently planned. On Apple platforms, decode HEIC with ImageIO and hand the pixels to PurePixel. The same applies to AVIF (AV1).
+- **HEIC**: encoding (requires an H.265 encoder); 4:4:4 chroma (produced by Apple encoders at quality 1.0 — use ≤ 0.95), grid (tiled) images, tiles, PCM, dependent slices and explicit scaling lists. The intra decoder was validated sample-exactly against a reference HEVC decoder; the final RGB output can differ from other decoders by small amounts because chroma upsampling filters are not standardized. AVIF (AV1) is not supported.
 - **Lossy and animated WebP** (VP8 coding; only lossless VP8L is supported).
 - **Animated GIF** beyond the first frame (no multi-frame API yet).
 - **JPEG**: arithmetic coding, 12-bit precision, lossless/hierarchical modes (all rare in practice).
