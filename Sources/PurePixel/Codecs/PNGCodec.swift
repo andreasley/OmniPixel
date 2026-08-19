@@ -350,6 +350,10 @@ enum PNGCodec: ImageCodec {
     // MARK: Encoding
 
     static func encode(_ image: Image) throws -> Data {
+        try encode(image, options: EncodingOptions())
+    }
+
+    static func encode(_ image: Image, options: EncodingOptions) throws -> Data {
         guard let width = UInt32(exactly: image.width), let height = UInt32(exactly: image.height) else {
             throw ImageError.invalidDimensions
         }
@@ -362,6 +366,10 @@ enum PNGCodec: ImageCodec {
         ihdr.writeUInt32BigEndian(height)
         ihdr.writeBytes([8, 6, 0, 0, 0])  // 8-bit RGBA, deflate, standard filtering, no interlace
         writeChunk(type: "IHDR", data: ihdr.bytes, to: &writer)
+
+        if let exif = options.exif, !exif.isEmpty {
+            writeChunk(type: "eXIf", data: exif.serializedPayload(), to: &writer)
+        }
 
         let bytesPerRow = image.width * 4
         var raw: [UInt8] = []

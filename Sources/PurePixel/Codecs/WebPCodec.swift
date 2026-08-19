@@ -546,6 +546,10 @@ enum WebPCodec: ImageCodec {
     // MARK: Encoding
 
     static func encode(_ image: Image) throws -> Data {
+        try encode(image, options: EncodingOptions())
+    }
+
+    static func encode(_ image: Image, options: EncodingOptions) throws -> Data {
         guard image.width <= 1 << 14, image.height <= 1 << 14 else {
             throw ImageError.invalidDimensions
         }
@@ -583,16 +587,39 @@ enum WebPCodec: ImageCodec {
         var payload: [UInt8] = [0x2F]
         payload += bits.finish()
 
+        // Assemble the chunk list; metadata requires the extended (VP8X) container.
+        var chunks: [(fourCC: String, payload: [UInt8])] = []
+        if let exif = options.exif, !exif.isEmpty {
+            var vp8x: [UInt8] = []
+            let hasAlpha = image.pixels.contains { $0.alpha < 255 }
+            vp8x.append(hasAlpha ? 0x18 : 0x08)  // EXIF flag, plus alpha when present
+            vp8x += [0, 0, 0]  // reserved
+            let width = image.width - 1
+            let height = image.height - 1
+            vp8x += [UInt8(width & 0xFF), UInt8(width >> 8 & 0xFF), UInt8(width >> 16 & 0xFF)]
+            vp8x += [UInt8(height & 0xFF), UInt8(height >> 8 & 0xFF), UInt8(height >> 16 & 0xFF)]
+            chunks.append(("VP8X", vp8x))
+            chunks.append(("VP8L", payload))
+            chunks.append(("EXIF", exif.serializedPayload()))
+        } else {
+            chunks.append(("VP8L", payload))
+        }
+
+        var body = ByteWriter()
+        for chunk in chunks {
+            body.writeBytes(Array(chunk.fourCC.utf8))
+            body.writeUInt32LittleEndian(UInt32(chunk.payload.count))
+            body.writeBytes(chunk.payload)
+            if chunk.payload.count & 1 == 1 {
+                body.writeByte(0)
+            }
+        }
+
         var writer = ByteWriter()
         writer.writeBytes(Array("RIFF".utf8))
-        writer.writeUInt32LittleEndian(UInt32(4 + 8 + payload.count + (payload.count & 1)))
+        writer.writeUInt32LittleEndian(UInt32(4 + body.bytes.count))
         writer.writeBytes(Array("WEBP".utf8))
-        writer.writeBytes(Array("VP8L".utf8))
-        writer.writeUInt32LittleEndian(UInt32(payload.count))
-        writer.writeBytes(payload)
-        if payload.count & 1 == 1 {
-            writer.writeByte(0)
-        }
+        writer.writeBytes(body.bytes)
         return writer.data
     }
 

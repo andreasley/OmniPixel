@@ -60,8 +60,14 @@ public struct EncodingOptions: Sendable {
     /// Values outside that range are clamped.
     public var jpegQuality: Int
 
-    public init(jpegQuality: Int = 85) {
+    /// EXIF metadata to embed. Honored when encoding JPEG, PNG and WebP;
+    /// the orientation tag is reset to upright because PurePixel always
+    /// encodes pixels in display order.
+    public var exif: EXIFData?
+
+    public init(jpegQuality: Int = 85, exif: EXIFData? = nil) {
         self.jpegQuality = jpegQuality
+        self.exif = exif
     }
 }
 
@@ -91,8 +97,16 @@ extension Image {
     }
 
     /// Decodes an image that is known to be in the given format.
+    ///
+    /// Camera files often store their pixels unrotated alongside an EXIF
+    /// orientation tag; it is applied here so decoding always yields
+    /// upright pixels.
     public init(data: Data, format: ImageFormat) throws {
-        self = try format.codec.decode(data)
+        var image = try format.codec.decode(data)
+        if let orientation = EXIFData(data: data)?.orientation, orientation != .topLeft {
+            image = image.oriented(by: orientation)
+        }
+        self = image
     }
 
     /// Encodes the image in the given format.

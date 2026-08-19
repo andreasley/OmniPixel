@@ -151,6 +151,17 @@ extension JPEGCodec {
         writer.writeUInt16BigEndian(1)  // vertical density
         writer.writeBytes([0, 0])  // no thumbnail
 
+        if let exif = options.exif, !exif.isEmpty {
+            let payload = exif.serializedPayload()
+            guard payload.count <= 65_527 else {
+                throw ImageError.unsupportedFeature(reason: "EXIF metadata over 64 KB cannot be embedded in JPEG")
+            }
+            writer.writeBytes([0xFF, 0xE1])  // APP1 (Exif)
+            writer.writeUInt16BigEndian(UInt16(2 + 6 + payload.count))
+            writer.writeBytes(Array("Exif".utf8) + [0, 0])
+            writer.writeBytes(payload)
+        }
+
         writer.writeBytes([0xFF, 0xDB])  // DQT, both tables in zigzag order
         writer.writeUInt16BigEndian(UInt16(2 + 2 * 65))
         writer.writeByte(0x00)
