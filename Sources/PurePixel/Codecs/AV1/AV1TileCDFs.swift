@@ -43,6 +43,20 @@ struct AV1TileCDFs {
     var useWiener: [[UInt16]]
     var useSgrproj: [[UInt16]]
     var restorationType: [[UInt16]]
+    // Motion vectors (intra block copy uses context 1). Row layouts:
+    var mvJoint: [[UInt16]]               // [ctx]
+    var mvClass: [[UInt16]]               // [ctx × 2 + comp]
+    var mvClass0Bit: [[UInt16]]           // [ctx × 2 + comp]
+    var mvClass0Fr: [[UInt16]]            // [(ctx × 2 + comp) × 2 + class0Bit]
+    var mvClass0Hp: [[UInt16]]            // [ctx × 2 + comp]
+    var mvFr: [[UInt16]]                  // [ctx × 2 + comp]
+    var mvHp: [[UInt16]]                  // [ctx × 2 + comp]
+    var mvSign: [[UInt16]]                // [ctx × 2 + comp]
+    var mvBit: [[UInt16]]                 // [(ctx × 2 + comp) × 10 + i]
+    var txfmSplit: [[UInt16]]             // [ctx]
+    var interTxTypeSet1: [[UInt16]]       // [txSizeSqr]
+    var interTxTypeSet2: [[UInt16]]
+    var interTxTypeSet3: [[UInt16]]       // [txSizeSqr]
 
     // MARK: Coefficient CDFs (quality-selected by init_coeff_cdfs)
 
@@ -105,6 +119,23 @@ struct AV1TileCDFs {
         useWiener = AV1DefaultCDFs.useWiener
         useSgrproj = AV1DefaultCDFs.useSgrproj
         restorationType = AV1DefaultCDFs.restorationType
+        // MV tables replicate the defaults per context (and per component
+        // where the defaults don't already carry that dimension).
+        mvJoint = [[UInt16]](repeating: AV1DefaultCDFs.mvJoint[0], count: 2)
+        mvClass = [AV1DefaultCDFs.mvClass[0], AV1DefaultCDFs.mvClass[1],
+                   AV1DefaultCDFs.mvClass[0], AV1DefaultCDFs.mvClass[1]]
+        mvClass0Bit = [[UInt16]](repeating: AV1DefaultCDFs.mvClass0Bit[0], count: 4)
+        mvClass0Fr = AV1DefaultCDFs.mvClass0Fr + AV1DefaultCDFs.mvClass0Fr
+        mvClass0Hp = [[UInt16]](repeating: AV1DefaultCDFs.mvClass0Hp[0], count: 4)
+        mvFr = AV1DefaultCDFs.mvFr + AV1DefaultCDFs.mvFr
+        mvHp = [[UInt16]](repeating: AV1DefaultCDFs.mvHp[0], count: 4)
+        mvSign = [[UInt16]](repeating: AV1DefaultCDFs.mvSign[0], count: 4)
+        mvBit = AV1DefaultCDFs.mvBit + AV1DefaultCDFs.mvBit
+            + AV1DefaultCDFs.mvBit + AV1DefaultCDFs.mvBit
+        txfmSplit = AV1DefaultCDFs.txfmSplit
+        interTxTypeSet1 = AV1DefaultCDFs.interTxTypeSet1
+        interTxTypeSet2 = AV1DefaultCDFs.interTxTypeSet2
+        interTxTypeSet3 = AV1DefaultCDFs.interTxTypeSet3
 
         // init_coeff_cdfs: quality context from base_q_idx.
         let qContext: Int

@@ -137,6 +137,16 @@ final class AV1TileDecoder {
     /// allocated when screen-content tools are on.
     private var paletteSizes = [[[UInt8]]]()
     private var paletteStore = [[UInt16]]()
+    /// Intra block copy state: current block's inter flag and displacement
+    /// vector (row, col in 1/8 luma samples), plus per-mi records.
+    private var blockIsInter = false
+    private var blockMvRow = 0
+    private var blockMvCol = 0
+    private var isInters: [[Bool]]
+    private var mvRowsGrid: [[Int32]]
+    private var mvColsGrid: [[Int32]]
+    private var decodedMi: [[Bool]]
+    private(set) var intraBlockCopyCount = 0
     /// The extent of decoded luma in the current block, for CfL.
     var maxLumaW = 0, maxLumaH = 0
     /// Per-superblock decoded flags per plane, offset by 1 in each axis so
@@ -207,6 +217,10 @@ final class AV1TileDecoder {
                 count: 2
             )
         }
+        isInters = [[Bool]](repeating: [Bool](repeating: false, count: miCols), count: miRows)
+        mvRowsGrid = [[Int32]](repeating: [Int32](repeating: 0, count: miCols), count: miRows)
+        mvColsGrid = [[Int32]](repeating: [Int32](repeating: 0, count: miCols), count: miRows)
+        decodedMi = [[Bool]](repeating: [Bool](repeating: false, count: miCols), count: miRows)
         currentQIndex = header.baseQIndex
     }
 
@@ -623,6 +637,9 @@ final class AV1TileDecoder {
         if blockSkip {
             resetBlockContext()
         }
+        if blockIsInter, let frame {
+            computeIntraBlockCopyPrediction(frame: frame)
+        }
         try residual()
 
         for y in 0..<bh4 where r + y < miRows {
@@ -634,6 +651,10 @@ final class AV1TileDecoder {
                 skips[r + y][c + x] = blockSkip
                 miSizes[r + y][c + x] = UInt8(miSize)
                 segmentIDs[r + y][c + x] = UInt8(segmentID)
+                isInters[r + y][c + x] = blockIsInter
+                mvRowsGrid[r + y][c + x] = Int32(blockMvRow)
+                mvColsGrid[r + y][c + x] = Int32(blockMvCol)
+                decodedMi[r + y][c + x] = true
                 if let frame {
                     frame.yModes[r + y][c + x] = UInt8(yMode)
                     frame.skips[r + y][c + x] = blockSkip
@@ -680,11 +701,29 @@ final class AV1TileDecoder {
         readDeltaLF()
         readDeltas = false
 
-        if header.allowIntrabc {
-            let useIntrabc = decoder.readSymbol(&cdf.intrabc[0])
-            if useIntrabc != 0 {
-                throw ImageError.unsupportedFeature(reason: "AV1 intra block copy is not supported yet")
-            }
+        blockIsInter = false
+        blockMvRow = 0
+        blockMvCol = 0
+        if header.allowIntrabc, decoder.readSymbol(&cdf.intrabc[0]) == 1 {
+            // Intra block copy: the block copies from the decoded part of
+            // the frame at an integer displacement.
+            blockIsInter = true
+            intraBlockCopyCount += 1
+            yMode = Self.dcPred
+            uvMode = Self.dcPred
+            angleDeltaY = 0
+            angleDeltaUV = 0
+            cflAlphaU = 0
+            cflAlphaV = 0
+            useFilterIntra = false
+            paletteSizeY = 0
+            paletteSizeUV = 0
+            paletteColorsY = []
+            paletteColorsU = []
+            paletteColorsV = []
+            let predicted = findIntraBlockCopyPrediction()
+            readMv(predictedRow: predicted.row, predictedCol: predicted.col)
+            return
         }
 
         // intra_frame_y_mode
@@ -1189,13 +1228,94 @@ final class AV1TileDecoder {
     // MARK: Transform sizes (5.11.15–16)
 
     private func readBlockTxSize() throws {
-        // Intra blocks always use the whole-block transform size path.
-        try readTxSize(allowSelect: true)
-        for row in miRow..<min(miRow + bh4, miRows) {
-            for column in miCol..<min(miCol + bw4, miCols) {
-                interTxSizes[row][column] = UInt8(txSize)
+        if txMode == 2, miSize > 0, blockIsInter, !blockSkip, !lossless {
+            // Inter (intra-block-copy) blocks code a transform split tree.
+            let maxTxSz = AV1Tables.maxTxSizeRect[miSize]
+            let txW4 = AV1Tables.txWidth[maxTxSz] / 4
+            let txH4 = AV1Tables.txHeight[maxTxSz] / 4
+            var row = miRow
+            while row < miRow + bh4 {
+                var column = miCol
+                while column < miCol + bw4 {
+                    readVarTxSize(row: row, column: column, txSz: maxTxSz, depth: 0)
+                    column += txW4
+                }
+                row += txH4
+            }
+        } else {
+            try readTxSize(allowSelect: !blockSkip || !blockIsInter)
+            for row in miRow..<min(miRow + bh4, miRows) {
+                for column in miCol..<min(miCol + bw4, miCols) {
+                    interTxSizes[row][column] = UInt8(txSize)
+                }
             }
         }
+    }
+
+    /// read_var_tx_size (5.11.17): the transform split tree of inter blocks.
+    private func readVarTxSize(row: Int, column: Int, txSz: Int, depth: Int) {
+        if row >= miRows || column >= miCols {
+            return
+        }
+        var split = false
+        if txSz != 0, depth != 2 {  // TX_4X4, MAX_VARTX_DEPTH
+            let above = aboveTxWidth(row: row, column: column) < AV1Tables.txWidth[txSz]
+            let left = leftTxHeight(row: row, column: column) < AV1Tables.txHeight[txSz]
+            let size = min(64, max(4 * bw4, 4 * bh4))
+            // The square transform size with this side length.
+            let maxSquare = size.trailingZeroBitCount - 2
+            let context = (AV1Tables.txSizeSqrUp[txSz] != maxSquare ? 3 : 0)
+                + (5 - 1 - maxSquare) * 6 + (above ? 1 : 0) + (left ? 1 : 0)  // TX_SIZES = 5
+            split = decoder.readSymbol(&cdf.txfmSplit[context]) == 1
+        }
+        let w4 = AV1Tables.txWidth[txSz] / 4
+        let h4 = AV1Tables.txHeight[txSz] / 4
+        if split {
+            let subTxSz = AV1Tables.splitTxSize[txSz]
+            let stepW = AV1Tables.txWidth[subTxSz] / 4
+            let stepH = AV1Tables.txHeight[subTxSz] / 4
+            var i = 0
+            while i < h4 {
+                var j = 0
+                while j < w4 {
+                    readVarTxSize(row: row + i, column: column + j, txSz: subTxSz, depth: depth + 1)
+                    j += stepW
+                }
+                i += stepH
+            }
+        } else {
+            for i in 0..<h4 where row + i < miRows {
+                for j in 0..<w4 where column + j < miCols {
+                    interTxSizes[row + i][column + j] = UInt8(txSz)
+                }
+            }
+            txSize = txSz
+        }
+    }
+
+    /// get_above_tx_width / get_left_tx_height (8.3.2, txfm_split).
+    private func aboveTxWidth(row: Int, column: Int) -> Int {
+        if row == miRow {
+            if !availU {
+                return 64
+            }
+            if skips[row - 1][column], isInters[row - 1][column] {
+                return 4 * AV1Tables.blockWidth4[Int(miSizes[row - 1][column])]
+            }
+        }
+        return AV1Tables.txWidth[Int(interTxSizes[row - 1][column])]
+    }
+
+    private func leftTxHeight(row: Int, column: Int) -> Int {
+        if column == miCol {
+            if !availL {
+                return 64
+            }
+            if skips[row][column - 1], isInters[row][column - 1] {
+                return 4 * AV1Tables.blockHeight4[Int(miSizes[row][column - 1])]
+            }
+        }
+        return AV1Tables.txHeight[Int(interTxSizes[row][column - 1])]
     }
 
     private func readTxSize(allowSelect: Bool) throws {
@@ -1224,17 +1344,19 @@ final class AV1TileDecoder {
     private func txDepthContext(maxRectTxSize: Int) -> Int {
         let maxTxWidth = AV1Tables.txWidth[maxRectTxSize]
         let maxTxHeight = AV1Tables.txHeight[maxRectTxSize]
-        // Intra frames never contain inter blocks, so only the transform
-        // width/height of the neighbors matters.
         let aboveW: Int
-        if availU {
-            aboveW = AV1Tables.txWidth[Int(interTxSizes[miRow - 1][miCol])]
+        if availU, isInters[miRow - 1][miCol] {
+            aboveW = 4 * AV1Tables.blockWidth4[Int(miSizes[miRow - 1][miCol])]
+        } else if availU {
+            aboveW = aboveTxWidth(row: miRow, column: miCol)
         } else {
             aboveW = 0
         }
         let leftH: Int
-        if availL {
-            leftH = AV1Tables.txHeight[Int(interTxSizes[miRow][miCol - 1])]
+        if availL, isInters[miRow][miCol - 1] {
+            leftH = 4 * AV1Tables.blockHeight4[Int(miSizes[miRow][miCol - 1])]
+        } else if availL {
+            leftH = leftTxHeight(row: miRow, column: miCol)
         } else {
             leftH = 0
         }
@@ -1276,6 +1398,18 @@ final class AV1TileDecoder {
                     }
                     let num4x4W = AV1Tables.blockWidth4[planeSize]
                     let num4x4H = AV1Tables.blockHeight4[planeSize]
+                    if blockIsInter, !lossless, plane == 0 {
+                        // Inter luma follows the coded transform split tree.
+                        let miRowChunk = miRow + (chunkY << 4)
+                        let miColChunk = miCol + (chunkX << 4)
+                        try transformTree(
+                            startX: miColChunk * 4,
+                            startY: miRowChunk * 4,
+                            width: num4x4W * 4,
+                            height: num4x4H * 4
+                        )
+                        continue
+                    }
                     let baseXBlock = (miCol >> subX) * 4
                     let baseYBlock = (miRow >> subY) * 4
                     var y = 0
@@ -1318,6 +1452,41 @@ final class AV1TileDecoder {
         return uvTx
     }
 
+    /// transform_tree (5.11.37): visits the coded transform blocks of an
+    /// inter luma region.
+    private func transformTree(startX: Int, startY: Int, width: Int, height: Int) throws {
+        let maxX = miCols * 4
+        let maxY = miRows * 4
+        if startX >= maxX || startY >= maxY {
+            return
+        }
+        let lumaTxSz = Int(interTxSizes[startY >> 2][startX >> 2])
+        let lumaW = AV1Tables.txWidth[lumaTxSz]
+        let lumaH = AV1Tables.txHeight[lumaTxSz]
+        if width <= lumaW, height <= lumaH {
+            let txSz = Self.findTxSize(width, height)
+            try transformBlock(plane: 0, baseX: startX, baseY: startY, txSz: txSz, x: 0, y: 0)
+        } else if width > height {
+            try transformTree(startX: startX, startY: startY, width: width / 2, height: height)
+            try transformTree(startX: startX + width / 2, startY: startY, width: width / 2, height: height)
+        } else if width < height {
+            try transformTree(startX: startX, startY: startY, width: width, height: height / 2)
+            try transformTree(startX: startX, startY: startY + height / 2, width: width, height: height / 2)
+        } else {
+            try transformTree(startX: startX, startY: startY, width: width / 2, height: height / 2)
+            try transformTree(startX: startX + width / 2, startY: startY, width: width / 2, height: height / 2)
+            try transformTree(startX: startX, startY: startY + height / 2, width: width / 2, height: height / 2)
+            try transformTree(startX: startX + width / 2, startY: startY + height / 2, width: width / 2, height: height / 2)
+        }
+    }
+
+    private static func findTxSize(_ width: Int, _ height: Int) -> Int {
+        for txSz in 0..<19 where AV1Tables.txWidth[txSz] == width && AV1Tables.txHeight[txSz] == height {
+            return txSz
+        }
+        return 0
+    }
+
     private func transformBlock(plane: Int, baseX: Int, baseY: Int, txSz: Int, x: Int, y: Int) throws {
         let startX = baseX + 4 * x
         let startY = baseY + 4 * y
@@ -1336,7 +1505,7 @@ final class AV1TileDecoder {
         let stepX = AV1Tables.txWidth[txSz] >> 2
         let stepY = AV1Tables.txHeight[txSz] >> 2
 
-        if let frame {
+        if let frame, !blockIsInter {
             let usesPalette = plane == 0 ? paletteSizeY > 0 : paletteSizeUV > 0
             if usesPalette {
                 predictPalette(frame: frame, plane: plane, startX: startX, startY: startY, x: x, y: y, txSz: txSz)
@@ -1419,6 +1588,265 @@ final class AV1TileDecoder {
         for i in 0..<h {
             for j in 0..<w {
                 frame.setSample(plane, startY + i, startX + j, palette[map[y * 4 + i][x * 4 + j]])
+            }
+        }
+    }
+
+    // MARK: Intra block copy (7.10.2 restricted to intra frames, 5.11.26)
+
+    /// find_mv_stack for the intra-block-copy case (single prediction of
+    /// INTRA_FRAME on an intra frame: no temporal or global candidates),
+    /// followed by the intrabc branch of assign_mv. Returns the predicted
+    /// displacement vector.
+    private func findIntraBlockCopyPrediction() -> (row: Int, col: Int) {
+        var stack: [(row: Int, col: Int)] = []
+        var weights: [Int] = []
+
+        func addCandidate(_ mvRow: Int, _ mvCol: Int, weight: Int) {
+            guard isInters[mvRow][mvCol] else { return }
+            // Only list 0 can match INTRA_FRAME on an intra frame.
+            let candidate = (row: Int(mvRowsGrid[mvRow][mvCol]), col: Int(mvColsGrid[mvRow][mvCol]))
+            for index in 0..<stack.count where stack[index] == candidate {
+                weights[index] += weight
+                return
+            }
+            if stack.count < 8 {  // MAX_REF_MV_STACK_SIZE
+                stack.append(candidate)
+                weights.append(weight)
+            }
+        }
+
+        func scanRow(_ deltaRowIn: Int) {
+            var deltaRow = deltaRowIn
+            var deltaCol = 0
+            let end4 = min(min(bw4, miCols - miCol), 16)
+            let useStep16 = bw4 >= 16
+            if abs(deltaRow) > 1 {
+                deltaRow += miRow & 1
+                deltaCol = 1 - (miCol & 1)
+            }
+            var i = 0
+            while i < end4 {
+                let mvRow = miRow + deltaRow
+                let mvCol = miCol + deltaCol + i
+                guard isInside(mvRow, mvCol) else { break }
+                var length = min(bw4, AV1Tables.blockWidth4[Int(miSizes[mvRow][mvCol])])
+                if abs(deltaRowIn) > 1 {
+                    length = max(2, length)
+                }
+                if useStep16 {
+                    length = max(4, length)
+                }
+                addCandidate(mvRow, mvCol, weight: length * 2)
+                i += length
+            }
+        }
+
+        func scanCol(_ deltaColIn: Int) {
+            var deltaCol = deltaColIn
+            var deltaRow = 0
+            let end4 = min(min(bh4, miRows - miRow), 16)
+            let useStep16 = bh4 >= 16
+            if abs(deltaCol) > 1 {
+                deltaRow = 1 - (miRow & 1)
+                deltaCol += miCol & 1
+            }
+            var i = 0
+            while i < end4 {
+                let mvRow = miRow + deltaRow + i
+                let mvCol = miCol + deltaCol
+                guard isInside(mvRow, mvCol) else { break }
+                var length = min(bh4, AV1Tables.blockHeight4[Int(miSizes[mvRow][mvCol])])
+                if abs(deltaColIn) > 1 {
+                    length = max(2, length)
+                }
+                if useStep16 {
+                    length = max(4, length)
+                }
+                addCandidate(mvRow, mvCol, weight: length * 2)
+                i += length
+            }
+        }
+
+        func scanPoint(_ deltaRow: Int, _ deltaCol: Int) {
+            let mvRow = miRow + deltaRow
+            let mvCol = miCol + deltaCol
+            if isInside(mvRow, mvCol), decodedMi[mvRow][mvCol] {
+                addCandidate(mvRow, mvCol, weight: 4)
+            }
+        }
+
+        scanRow(-1)
+        scanCol(-1)
+        if max(bw4, bh4) <= 16 {
+            scanPoint(-1, bw4)
+        }
+        let numNearest = stack.count
+        for index in 0..<numNearest {
+            weights[index] += 640  // REF_CAT_LEVEL
+        }
+        scanPoint(-1, -1)
+        scanRow(-3)
+        scanCol(-3)
+        if bh4 > 1 {
+            scanRow(-5)
+        }
+        if bw4 > 1 {
+            scanCol(-5)
+        }
+
+        // Stable weight sort within each partition (7.10.2.11).
+        func sortRange(_ start: Int, _ endIn: Int) {
+            var end = endIn
+            while end > start {
+                var newEnd = start
+                for index in (start + 1)..<end where weights[index - 1] < weights[index] {
+                    weights.swapAt(index - 1, index)
+                    stack.swapAt(index - 1, index)
+                    newEnd = index
+                }
+                end = newEnd
+            }
+        }
+        sortRange(0, numNearest)
+        sortRange(numNearest, stack.count)
+
+        // Extra search adds nothing on intra frames (no candidate has a
+        // reference frame beyond INTRA_FRAME); missing entries are the
+        // (zero) global motion vector without growing the count.
+        let numMvFound = stack.count
+        while stack.count < 2 {
+            stack.append((0, 0))
+        }
+
+        // Clamping (7.10.2.14) applies to the found entries only.
+        let border = 128  // MV_BORDER
+        for index in 0..<numMvFound {
+            let rowLow = -(miRow * 4) * 8 - (border + bh4 * 4 * 8)
+            let rowHigh = ((miRows - bh4 - miRow) * 4) * 8 + (border + bh4 * 4 * 8)
+            let colLow = -(miCol * 4) * 8 - (border + bw4 * 4 * 8)
+            let colHigh = ((miCols - bw4 - miCol) * 4) * 8 + (border + bw4 * 4 * 8)
+            stack[index].row = min(max(stack[index].row, rowLow), rowHigh)
+            stack[index].col = min(max(stack[index].col, colLow), colHigh)
+        }
+
+        // assign_mv, intrabc branch (5.11.26).
+        var predicted = stack[0]
+        if predicted == (0, 0) {
+            predicted = stack[1]
+        }
+        if predicted == (0, 0) {
+            let sbSize4 = AV1Tables.blockHeight4[sbSize]
+            if miRow - sbSize4 < miRowStart {
+                predicted = (0, -(sbSize4 * 4 + 256) * 8)  // INTRABC_DELAY_PIXELS
+            } else {
+                predicted = (-(sbSize4 * 4 * 8), 0)
+            }
+        }
+        return predicted
+    }
+
+    /// read_mv + read_mv_component (5.11.31–32) with the intra-block-copy
+    /// context; intra frames force integer precision.
+    private func readMv(predictedRow: Int, predictedCol: Int) {
+        let context = 1  // MV_INTRABC_CONTEXT
+        var diffRow = 0
+        var diffCol = 0
+        let joint = decoder.readSymbol(&cdf.mvJoint[context])
+        if joint == 2 || joint == 3 {  // MV_JOINT_HZVNZ / HNZVNZ: row changes
+            diffRow = readMvComponent(context: context, component: 0)
+        }
+        if joint == 1 || joint == 3 {  // MV_JOINT_HNZVZ / HNZVNZ: col changes
+            diffCol = readMvComponent(context: context, component: 1)
+        }
+        blockMvRow = predictedRow + diffRow
+        blockMvCol = predictedCol + diffCol
+    }
+
+    private func readMvComponent(context: Int, component: Int) -> Int {
+        let base = context * 2 + component
+        let sign = decoder.readSymbol(&cdf.mvSign[base])
+        let mvClass = decoder.readSymbol(&cdf.mvClass[base])
+        var magnitude: Int
+        if mvClass == 0 {
+            let bit = decoder.readSymbol(&cdf.mvClass0Bit[base])
+            // Intra frames force integer motion: fr = 3, hp = 1.
+            magnitude = ((bit << 3) | (3 << 1) | 1) + 1
+        } else {
+            var d = 0
+            for i in 0..<mvClass {
+                let bit = decoder.readSymbol(&cdf.mvBit[base * 10 + i])
+                d |= bit << i
+            }
+            magnitude = 2 << (mvClass + 2)  // CLASS0_SIZE << (class + 2)
+            magnitude += ((d << 3) | (3 << 1) | 1) + 1
+        }
+        return sign == 1 ? -magnitude : magnitude
+    }
+
+    /// compute_prediction (5.11.33) for intra block copy: one whole-block
+    /// inter prediction per plane (all neighbors are INTRA_FRAME, so the
+    /// spec's whole-block path always applies).
+    private func computeIntraBlockCopyPrediction(frame: AV1FrameBuffer) {
+        for plane in 0..<(1 + (hasChroma ? 2 : 0)) {
+            let subX = plane > 0 ? chromaSubX : 0
+            let subY = plane > 0 ? chromaSubY : 0
+            let planeSize = AV1Tables.subsampledSize[miSize][subX][subY]
+            let width = AV1Tables.blockWidth4[planeSize] * 4
+            let height = AV1Tables.blockHeight4[planeSize] * 4
+            let baseX = (miCol >> subX) * 4
+            let baseY = (miRow >> subY) * 4
+            predictIntraBlockCopy(
+                frame: frame, plane: plane, x: baseX, y: baseY,
+                width: width, height: height, subX: subX, subY: subY
+            )
+        }
+    }
+
+    /// Block inter prediction (7.11.3.3–4) restricted to intra block copy:
+    /// no scaling, bilinear filtering (only chroma can land off-sample).
+    private func predictIntraBlockCopy(
+        frame: AV1FrameBuffer, plane: Int, x: Int, y: Int,
+        width: Int, height: Int, subX: Int, subY: Int
+    ) {
+        let bitDepth = frame.bitDepth
+        let round0 = bitDepth == 12 ? 5 : 3
+        let round1 = bitDepth == 12 ? 9 : 11
+        // The reference area for intra block copy is the mi-aligned frame.
+        let lastX = ((miCols * 4) >> subX) - 1
+        let lastY = ((miRows * 4) >> subY) - 1
+        // Motion vector scaling degenerates to a fixed-point offset.
+        let startX = (((x << 4) + ((2 * blockMvCol) >> subX)) << 6) + 32
+        let startY = (((y << 4) + ((2 * blockMvRow) >> subY)) << 6) + 32
+        let filter = AV1Tables.subpelFilters[3]  // BILINEAR
+
+        let stride = frame.allocatedWidth[plane]
+        let samples = frame.planes[plane]
+        var intermediate = [Int](repeating: 0, count: (height + 7) * width)
+        for r in 0..<(height + 7) {
+            let refY = min(max((startY >> 10) + r - 3, 0), lastY)
+            for c in 0..<width {
+                let p = startX + 1024 * c
+                let taps = filter[(p >> 6) & 15]
+                var s = 0
+                for t in 0..<8 where taps[t] != 0 {
+                    let refX = min(max((p >> 10) + t - 3, 0), lastX)
+                    s += taps[t] * samples[refY * stride + refX]
+                }
+                intermediate[r * width + c] = (s + (1 << (round0 - 1))) >> round0
+            }
+        }
+        for r in 0..<height {
+            let p = (startY & 1023) + 1024 * r
+            let taps = filter[(p >> 6) & 15]
+            let baseRow = p >> 10
+            for c in 0..<width {
+                var s = 0
+                for t in 0..<8 where taps[t] != 0 {
+                    s += taps[t] * intermediate[(baseRow + t) * width + c]
+                }
+                let value = (s + (1 << (round1 - 1))) >> round1
+                frame.setSample(plane, y + r, x + c, Self.clip1(value, bitDepth))
             }
         }
     }
@@ -1601,24 +2029,38 @@ final class AV1TileDecoder {
     // MARK: Transform types (5.11.47–48)
 
     private func readTransformType(x4: Int, y4: Int, txSz: Int) {
-        let set = intraTxSet(txSz)
+        let set = transformSet(txSz)
         var txType = 0
         let qIndexForSyntax = header.segmentationEnabled
             ? header.qIndex(forSegment: segmentID) : header.baseQIndex
         if set > 0, qIndexForSyntax > 0 {
-            let intraDir: Int
-            if useFilterIntra {
-                intraDir = AV1Tables.filterIntraModeToIntraDir[filterIntraMode]
-            } else {
-                intraDir = yMode
-            }
             let sqr = AV1Tables.txSizeSqr[txSz]
-            if set == 1 {
-                let symbol = decoder.readSymbol(&cdf.intraTxTypeSet1[sqr * 13 + intraDir])
-                txType = AV1Tables.intraTxTypeInvSet1[symbol]
+            if blockIsInter {
+                switch set {
+                case 1:
+                    let symbol = decoder.readSymbol(&cdf.interTxTypeSet1[sqr])
+                    txType = AV1Tables.interTxTypeInvSet1[symbol]
+                case 2:
+                    let symbol = decoder.readSymbol(&cdf.interTxTypeSet2[0])
+                    txType = AV1Tables.interTxTypeInvSet2[symbol]
+                default:
+                    let symbol = decoder.readSymbol(&cdf.interTxTypeSet3[sqr])
+                    txType = AV1Tables.interTxTypeInvSet3[symbol]
+                }
             } else {
-                let symbol = decoder.readSymbol(&cdf.intraTxTypeSet2[sqr * 13 + intraDir])
-                txType = AV1Tables.intraTxTypeInvSet2[symbol]
+                let intraDir: Int
+                if useFilterIntra {
+                    intraDir = AV1Tables.filterIntraModeToIntraDir[filterIntraMode]
+                } else {
+                    intraDir = yMode
+                }
+                if set == 1 {
+                    let symbol = decoder.readSymbol(&cdf.intraTxTypeSet1[sqr * 13 + intraDir])
+                    txType = AV1Tables.intraTxTypeInvSet1[symbol]
+                } else {
+                    let symbol = decoder.readSymbol(&cdf.intraTxTypeSet2[sqr * 13 + intraDir])
+                    txType = AV1Tables.intraTxTypeInvSet2[symbol]
+                }
             }
         }
         let w4 = AV1Tables.txWidth[txSz] >> 2
@@ -1630,12 +2072,21 @@ final class AV1TileDecoder {
         }
     }
 
-    /// get_tx_set for intra blocks: 0 = DCT only, 1 = TX_SET_INTRA_1,
-    /// 2 = TX_SET_INTRA_2.
-    private func intraTxSet(_ txSz: Int) -> Int {
+    /// get_tx_set: for intra, 0 = DCT only, 1/2 = TX_SET_INTRA_1/2; for
+    /// inter, 1…3 = TX_SET_INTER_1…3.
+    private func transformSet(_ txSz: Int) -> Int {
         let sqrUp = AV1Tables.txSizeSqrUp[txSz]
         if sqrUp > 3 {  // beyond TX_32X32
             return 0
+        }
+        if blockIsInter {
+            if header.reducedTxSet || sqrUp == 3 {
+                return 3  // TX_SET_INTER_3
+            }
+            if AV1Tables.txSizeSqr[txSz] == 2 {  // TX_16X16
+                return 2
+            }
+            return 1
         }
         if sqrUp == 3 {  // TX_32X32
             return 0
@@ -1653,9 +2104,18 @@ final class AV1TileDecoder {
         if lossless || AV1Tables.txSizeSqrUp[txSz] > 3 {
             return 0
         }
-        let txSet = intraTxSet(txSz)
+        let txSet = transformSet(txSz)
         if plane == 0 {
             return Int(txTypes[y4][x4])
+        }
+        if blockIsInter {
+            let lumaX4 = max(miCol, x4 << chromaSubX)
+            let lumaY4 = max(miRow, y4 << chromaSubY)
+            let txType = Int(txTypes[lumaY4][lumaX4])
+            if AV1Tables.txTypeInSetInter[txSet][txType] == 0 {
+                return 0
+            }
+            return txType
         }
         let txType = AV1Tables.modeToTxfm[uvMode]
         if AV1Tables.txTypeInSetIntra[txSet][txType] == 0 {

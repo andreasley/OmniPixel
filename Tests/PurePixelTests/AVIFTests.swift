@@ -424,6 +424,78 @@ struct AVIFTests {
             #expect(abs(Int(pixel.blue) - Int(expected.blue)) <= 4)
         }
 
+        // Intra block copy: repeated-stamp screen content makes the
+        // encoder copy blocks from earlier in the frame. Validated
+        // sample-exactly against avifdec during bring-up.
+        var stampSource = Image(width: 256, height: 192, fill: .white)
+        let stampColors = [
+            RGBA(red: 0, green: 0, blue: 0),
+            RGBA(red: 220, green: 60, blue: 60),
+            RGBA(red: 60, green: 120, blue: 220),
+        ]
+        var stampSeed = 9
+        var stamp = [[RGBA]](repeating: [RGBA](repeating: .black, count: 12), count: 16)
+        for sy in 0..<16 {
+            for sx in 0..<12 {
+                stampSeed = (stampSeed &* 1103515245 &+ 12345) & 0x7FFFFFFF
+                stamp[sy][sx] = stampColors[stampSeed % 3]
+            }
+        }
+        var gy = 0
+        while gy < 192 - 16 {
+            var gx = 0
+            while gx < 256 - 12 {
+                for sy in 0..<16 {
+                    for sx in 0..<12 {
+                        stampSource[gx + sx, gy + sy] = stamp[sy][sx]
+                    }
+                }
+                gx += 20
+            }
+            gy += 24
+        }
+        let stampPNG = directory.appendingPathComponent("purepixel-avif-ibc.png")
+        try stampSource.encoded(as: .png).write(to: stampPNG)
+        let ibcURL = directory.appendingPathComponent("purepixel-avif-ibc.avif")
+        try? FileManager.default.removeItem(at: ibcURL)
+        let ibcProcess = Process()
+        ibcProcess.executableURL = URL(fileURLWithPath: encoder)
+        ibcProcess.arguments = [
+            "-s", "6", "-q", "80", "-y", "444",
+            "-a", "tune-content=screen",
+            stampPNG.path, ibcURL.path,
+        ]
+        ibcProcess.standardOutput = Pipe()
+        ibcProcess.standardError = Pipe()
+        try ibcProcess.run()
+        ibcProcess.waitUntilExit()
+        try #require(ibcProcess.terminationStatus == 0)
+        let ibcData = try Data(contentsOf: ibcURL)
+        let ibcStream = try AVIFCodec.parseStream(from: ibcData)
+        let ibcDecoders = try AVIFCodec.decodeTiles(stream: ibcStream)
+        let ibcBlocks = ibcDecoders.map(\.intraBlockCopyCount).reduce(0, +)
+        if ibcStream.frameHeader.allowIntrabc {
+            #expect(ibcBlocks > 0, "expected the encoder to use intra block copy")
+        }
+        let ibcImage = try Image(data: ibcData)
+        #expect(ibcImage.width == 256)
+        #expect(ibcImage.height == 192)
+        // Repeated stamps survive block copying almost exactly.
+        var ibcSumSquared = 0.0
+        for y in 0..<192 {
+            for x in 0..<256 {
+                let a = ibcImage[x, y]
+                let b = stampSource[x, y]
+                for (u, v) in [(a.red, b.red), (a.green, b.green), (a.blue, b.blue)] {
+                    let diff = Double(Int(u) - Int(v))
+                    ibcSumSquared += diff * diff
+                }
+            }
+        }
+        let ibcMSE = ibcSumSquared / Double(256 * 192 * 3)
+        let ibcPSNR = ibcMSE == 0 ? 99 : 10 * (log10(255.0 * 255.0) - log10(ibcMSE))
+        #expect(ibcPSNR > 30, "IBC PSNR \(ibcPSNR) too low")
+
         // Grid: a multi-item tiled AVIF composites to the declared size.
         var gridSource = Image(width: 128, height: 96)
         for y in 0..<96 {
