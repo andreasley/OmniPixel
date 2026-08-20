@@ -44,18 +44,21 @@ final class HEVCPictureDecoder {
     private let sps: HEVCSequenceParameterSet
     private let pps: HEVCPictureParameterSet
 
-    private var cabac: CABACDecoder
-    private var contexts: HEVCContextSet
-    private var savedWPPContexts: HEVCContextSet?
+    // Dynamic exclusivity enforcement on the hot mutable state costs a TLS
+    // lookup per decoded bin; decoding is strictly single-threaded per
+    // instance and never forms aliasing inout pairs.
+    @exclusivity(unchecked) private var cabac: CABACDecoder
+    @exclusivity(unchecked) private var contexts: HEVCContextSet
+    @exclusivity(unchecked) private var savedWPPContexts: HEVCContextSet?
 
     // Picture-level grids at 4×4 granularity for context derivations.
     private let grid4Width: Int
     private let grid4Height: Int
-    private var depthGrid: [Int8]      // coding-tree depth, -1 = undecoded
-    private var modeGrid: [Int8]       // luma intra mode, -1 = unavailable
-    private var chromaGrid: [Int8]
-    private var qpGrid: [Int8]         // luma QP of the covering CU
-    private var ctbSliceIndex: [Int]   // slice index per CTB, -1 = undecoded
+    @exclusivity(unchecked) private var depthGrid: [Int8]      // coding-tree depth, -1 = undecoded
+    @exclusivity(unchecked) private var modeGrid: [Int8]       // luma intra mode, -1 = unavailable
+    @exclusivity(unchecked) private var chromaGrid: [Int8]
+    @exclusivity(unchecked) private var qpGrid: [Int8]         // luma QP of the covering CU
+    @exclusivity(unchecked) private var ctbSliceIndex: [Int]   // slice index per CTB, -1 = undecoded
 
     // Per-slice state.
     private var sliceQP = 26
@@ -71,10 +74,15 @@ final class HEVCPictureDecoder {
     private var currentChromaMode = 1
 
     // Residual-decoding scratch, reused for every sub-block.
-    private var positionScratch = [Int](repeating: 0, count: 16)
-    private var levelScratch = [Int](repeating: 0, count: 16)
+    @exclusivity(unchecked) private var positionScratch = [Int](repeating: 0, count: 16)
+    @exclusivity(unchecked) private var levelScratch = [Int](repeating: 0, count: 16)
+    // Coded-sub-block map scratch, reused per TU (max 8×8 sub-blocks).
+    @exclusivity(unchecked) private var subBlockCodedScratch = [Bool](repeating: false, count: 64)
+    // Intra-mode scratch, reused per CU (max 4 partitions).
+    @exclusivity(unchecked) private var prevIntraFlagScratch = [Bool](repeating: false, count: 4)
+    @exclusivity(unchecked) private var lumaModeScratch = [Int](repeating: 1, count: 4)
 
-    private(set) var picture = HEVCPictureData()
+    @exclusivity(unchecked) private(set) var picture = HEVCPictureData()
 
     /// Diagnostic hook for decoder bring-up: receives coarse syntax events.
     var trace: ((String) -> Void)?
@@ -372,34 +380,32 @@ final class HEVCPictureDecoder {
         let partSize = (1 << log2Size) >> (partsAcross - 1)
         let partCount = partsAcross * partsAcross
 
-        var previousFlags = [Bool](repeating: false, count: partCount)
         for part in 0..<partCount {
-            previousFlags[part] = try cabac.decodeBin(&contexts.prevIntraLumaPred) == 1
+            prevIntraFlagScratch[part] = try cabac.decodeBin(&contexts.prevIntraLumaPred) == 1
         }
 
-        var lumaModes = [Int](repeating: 1, count: partCount)
         for part in 0..<partCount {
             let partX = x + (part & 1) * partSize
             let partY = y + (part >> 1) * partSize
             let candidates = mostProbableModes(x: partX, y: partY)
-            if previousFlags[part] {
+            if prevIntraFlagScratch[part] {
                 // mpm_idx: truncated unary of up to two bypass bins.
                 var index = 0
                 if try cabac.decodeBypass() == 1 {
                     index = try cabac.decodeBypass() == 1 ? 2 : 1
                 }
-                lumaModes[part] = candidates[index]
+                lumaModeScratch[part] = candidates[index]
             } else {
                 var mode = try cabac.decodeBypassBits(5)
                 // The three most probable modes are removed from the code space.
                 for candidate in candidates.sorted() where mode >= candidate {
                     mode += 1
                 }
-                lumaModes[part] = mode
+                lumaModeScratch[part] = mode
             }
             for blockY in stride(from: partY, to: min(partY + partSize, sps.height), by: 4) {
                 for blockX in stride(from: partX, to: min(partX + partSize, sps.width), by: 4) {
-                    modeGrid[gridIndex(x: blockX, y: blockY)] = Int8(lumaModes[part])
+                    modeGrid[gridIndex(x: blockX, y: blockY)] = Int8(lumaModeScratch[part])
                 }
             }
         }
@@ -409,15 +415,15 @@ final class HEVCPictureDecoder {
         if try cabac.decodeBin(&contexts.intraChromaPredMode) == 1 {
             let index = try cabac.decodeBypassBits(2)
             var candidates = [0, 26, 10, 1]
-            for i in 0..<4 where candidates[i] == lumaModes[0] {
+            for i in 0..<4 where candidates[i] == lumaModeScratch[0] {
                 candidates[i] = 34
             }
             chromaMode = candidates[index]
         } else {
-            chromaMode = lumaModes[0]
+            chromaMode = lumaModeScratch[0]
         }
         currentChromaMode = chromaMode
-        trace?("  CU (\(x),\(y)) size \(1 << log2Size) modes \(lumaModes) chroma \(chromaMode) tqb \(currentTransquantBypass)")
+        trace?("  CU (\(x),\(y)) size \(1 << log2Size) modes \(Array(lumaModeScratch[0..<partCount])) chroma \(chromaMode) tqb \(currentTransquantBypass)")
         let size = 1 << log2Size
         for blockY in stride(from: y, to: min(y + size, sps.height), by: 4) {
             for blockX in stride(from: x, to: min(x + size, sps.width), by: 4) {
@@ -680,7 +686,9 @@ final class HEVCPictureDecoder {
         }
 
         var coefficients = [Int](repeating: 0, count: size * size)
-        var subBlockCoded = [Bool](repeating: false, count: subBlockCount * subBlockCount)
+        for i in 0..<(subBlockCount * subBlockCount) {
+            subBlockCodedScratch[i] = false
+        }
         var previousGreater1Context: Int?
 
         var subBlockIndex = lastSubBlock
@@ -690,10 +698,10 @@ final class HEVCPictureDecoder {
             let isFirst = subBlockIndex == 0
 
             var previousCoded = 0
-            if subBlock.x + 1 < subBlockCount, subBlockCoded[subBlock.y * subBlockCount + subBlock.x + 1] {
+            if subBlock.x + 1 < subBlockCount, subBlockCodedScratch[subBlock.y * subBlockCount + subBlock.x + 1] {
                 previousCoded |= 1
             }
-            if subBlock.y + 1 < subBlockCount, subBlockCoded[(subBlock.y + 1) * subBlockCount + subBlock.x] {
+            if subBlock.y + 1 < subBlockCount, subBlockCodedScratch[(subBlock.y + 1) * subBlockCount + subBlock.x] {
                 previousCoded |= 2
             }
 
@@ -704,7 +712,7 @@ final class HEVCPictureDecoder {
                 coded = try cabac.decodeBin(&contexts.codedSubBlock[contextIndex]) == 1
                 inferDCSignificance = coded
             }
-            subBlockCoded[subBlock.y * subBlockCount + subBlock.x] = coded
+            subBlockCodedScratch[subBlock.y * subBlockCount + subBlock.x] = coded
             fineTrace?("      sb (\(subBlock.x),\(subBlock.y)) coded \(coded) prev \(previousCoded) @bit \(cabac.bitPosition)")
 
             if coded {
