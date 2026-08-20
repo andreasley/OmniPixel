@@ -163,6 +163,9 @@ import UniformTypeIdentifiers
                 pixels[i + 3] = 255
             }
         }
+        // noneSkipLast: the content is opaque, and declaring an alpha
+        // channel makes ImageIO's HEIF writer log a warning while
+        // stripping it anyway.
         let context = try #require(CGContext(
             data: &pixels,
             width: width,
@@ -170,7 +173,7 @@ import UniformTypeIdentifiers
             bitsPerComponent: 8,
             bytesPerRow: width * 4,
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
         ))
         let cgImage = try #require(context.makeImage())
         let output = NSMutableData()
