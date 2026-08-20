@@ -11,22 +11,24 @@ final class AV1FrameBuffer {
     /// Superblock-aligned allocation (blocks may overhang the mi area).
     let allocatedWidth: [Int]
     let allocatedHeight: [Int]
-    /// Samples per plane, row-major over the allocated size.
-    var planes: [[Int]]
+    /// Samples per plane, row-major over the allocated size. Exclusivity
+    /// is unchecked: accesses form per transform block in hot loops, and
+    /// decoding never creates aliasing inout pairs over the planes.
+    @exclusivity(unchecked) var planes: [[Int]]
 
     // MARK: Per-position decoding state consumed by the loop filters
 
     let miRows, miCols: Int
-    var miSizes: [[UInt8]]
-    var yModes: [[UInt8]]
-    var segmentIDs: [[UInt8]]
-    var skips: [[Bool]]
-    /// Loop filter deltas per mode-info unit (4 filter indices).
-    var deltaLFs: [[[Int8]]]
+    @exclusivity(unchecked) var miSizes: [[UInt8]]
+    @exclusivity(unchecked) var yModes: [[UInt8]]
+    @exclusivity(unchecked) var segmentIDs: [[UInt8]]
+    @exclusivity(unchecked) var skips: [[Bool]]
+    /// Loop filter deltas per mode-info unit, flat (mi × 4 filter indices).
+    @exclusivity(unchecked) var deltaLFs: [Int8]
     /// CDEF strength index per 64×64 (-1 = none coded).
-    var cdefIndex: [[Int8]]
+    @exclusivity(unchecked) var cdefIndex: [[Int8]]
     /// Transform sizes per plane in plane-subsampled 4-sample units.
-    var loopfilterTxSizes: [[[UInt8]]]
+    @exclusivity(unchecked) var loopfilterTxSizes: [[[UInt8]]]
 
     init(sequence: AV1SequenceHeader, header: AV1FrameHeader) {
         bitDepth = sequence.bitDepth
@@ -57,10 +59,7 @@ final class AV1FrameBuffer {
         yModes = [[UInt8]](repeating: [UInt8](repeating: 0, count: miCols), count: miRows)
         segmentIDs = [[UInt8]](repeating: [UInt8](repeating: 0, count: miCols), count: miRows)
         skips = [[Bool]](repeating: [Bool](repeating: false, count: miCols), count: miRows)
-        deltaLFs = [[[Int8]]](
-            repeating: [[Int8]](repeating: [0, 0, 0, 0], count: miCols),
-            count: miRows
-        )
+        deltaLFs = [Int8](repeating: 0, count: miRows * miCols * 4)
         cdefIndex = [[Int8]](
             repeating: [Int8](repeating: -1, count: (miCols + 15) >> 4),
             count: (miRows + 15) >> 4
@@ -111,33 +110,33 @@ extension AV1TileDecoder {
         let maxX = frame.width[plane] - 1
         let maxY = frame.height[plane] - 1
 
-        // AboveRow / LeftCol with indices -2 … 2(w+h): stored with offset.
+        // AboveRow / LeftCol with indices -2 … 2(w+h): stored with offset 4
+        // in the reused scratch arrays; pred is the flat scratch with
+        // stride w.
         let offset = 4
-        var aboveRow = [Int](repeating: 0, count: 2 * (w + h) + 8)
-        var leftCol = [Int](repeating: 0, count: 2 * (w + h) + 8)
 
         if !haveAbove && haveLeft {
             let value = frame.sample(plane, y, x - 1)
-            for i in 0..<(w + h) { aboveRow[offset + i] = value }
+            for i in 0..<(w + h) { scratchAbove[offset + i] = value }
         } else if !haveAbove && !haveLeft {
             let value = (1 << (bitDepth - 1)) - 1
-            for i in 0..<(w + h) { aboveRow[offset + i] = value }
+            for i in 0..<(w + h) { scratchAbove[offset + i] = value }
         } else {
             let aboveLimit = min(maxX, x + (haveAboveRight ? 2 * w : w) - 1)
             for i in 0..<(w + h) {
-                aboveRow[offset + i] = frame.sample(plane, y - 1, min(aboveLimit, x + i))
+                scratchAbove[offset + i] = frame.sample(plane, y - 1, min(aboveLimit, x + i))
             }
         }
         if !haveLeft && haveAbove {
             let value = frame.sample(plane, y - 1, x)
-            for i in 0..<(w + h) { leftCol[offset + i] = value }
+            for i in 0..<(w + h) { scratchLeft[offset + i] = value }
         } else if !haveLeft && !haveAbove {
             let value = (1 << (bitDepth - 1)) + 1
-            for i in 0..<(w + h) { leftCol[offset + i] = value }
+            for i in 0..<(w + h) { scratchLeft[offset + i] = value }
         } else {
             let leftLimit = min(maxY, y + (haveBelowLeft ? 2 * h : h) - 1)
             for i in 0..<(w + h) {
-                leftCol[offset + i] = frame.sample(plane, min(leftLimit, y + i), x - 1)
+                scratchLeft[offset + i] = frame.sample(plane, min(leftLimit, y + i), x - 1)
             }
         }
         let corner: Int
@@ -150,100 +149,97 @@ extension AV1TileDecoder {
         } else {
             corner = 1 << (bitDepth - 1)
         }
-        aboveRow[offset - 1] = corner
-        leftCol[offset - 1] = corner
+        scratchAbove[offset - 1] = corner
+        scratchLeft[offset - 1] = corner
 
-        var pred = [[Int]](repeating: [Int](repeating: 0, count: w), count: h)
         if plane == 0, useFilterIntra {
-            recursiveIntraPrediction(
-                pred: &pred, w: w, h: h, bitDepth: bitDepth,
-                aboveRow: aboveRow, leftCol: leftCol, offset: offset
-            )
+            recursiveIntraPrediction(w: w, h: h, bitDepth: bitDepth)
         } else if mode >= 1 && mode <= 8 {
             directionalIntraPrediction(
-                pred: &pred, plane: plane, x: x, y: y,
+                plane: plane, x: x, y: y,
                 haveLeft: haveLeft, haveAbove: haveAbove,
-                mode: mode, w: w, h: h, maxX: maxX, maxY: maxY, bitDepth: bitDepth,
-                aboveRow: &aboveRow, leftCol: &leftCol, offset: offset
+                mode: mode, w: w, h: h, maxX: maxX, maxY: maxY, bitDepth: bitDepth
             )
         } else if mode >= 9 && mode <= 11 {
-            smoothIntraPrediction(
-                pred: &pred, mode: mode, log2W: log2W, log2H: log2H, w: w, h: h,
-                aboveRow: aboveRow, leftCol: leftCol, offset: offset
-            )
+            smoothIntraPrediction(mode: mode, log2W: log2W, log2H: log2H, w: w, h: h)
         } else if mode == 0 {
             dcIntraPrediction(
-                pred: &pred, haveLeft: haveLeft, haveAbove: haveAbove,
-                log2W: log2W, log2H: log2H, w: w, h: h, bitDepth: bitDepth,
-                aboveRow: aboveRow, leftCol: leftCol, offset: offset
+                haveLeft: haveLeft, haveAbove: haveAbove,
+                log2W: log2W, log2H: log2H, w: w, h: h, bitDepth: bitDepth
             )
         } else {
             // PAETH_PRED
+            let topLeft = scratchAbove[offset - 1]
             for i in 0..<h {
+                let left = scratchLeft[offset + i]
                 for j in 0..<w {
-                    let base = aboveRow[offset + j] + leftCol[offset + i] - aboveRow[offset - 1]
-                    let pLeft = abs(base - leftCol[offset + i])
-                    let pTop = abs(base - aboveRow[offset + j])
-                    let pTopLeft = abs(base - aboveRow[offset - 1])
+                    let above = scratchAbove[offset + j]
+                    let base = above + left - topLeft
+                    let pLeft = abs(base - left)
+                    let pTop = abs(base - above)
+                    let pTopLeft = abs(base - topLeft)
                     if pLeft <= pTop && pLeft <= pTopLeft {
-                        pred[i][j] = leftCol[offset + i]
+                        scratchPred[i * w + j] = left
                     } else if pTop <= pTopLeft {
-                        pred[i][j] = aboveRow[offset + j]
+                        scratchPred[i * w + j] = above
                     } else {
-                        pred[i][j] = aboveRow[offset - 1]
+                        scratchPred[i * w + j] = topLeft
                     }
                 }
             }
         }
-        for i in 0..<h {
-            for j in 0..<w {
-                frame.setSample(plane, y + i, x + j, pred[i][j])
+        let stride = frame.allocatedWidth[plane]
+        scratchPred.withUnsafeBufferPointer { pred in
+            frame.planes[plane].withUnsafeMutableBufferPointer { dest in
+                for i in 0..<h {
+                    let sourceBase = i * w
+                    let destBase = (y + i) * stride + x
+                    for j in 0..<w {
+                        dest[destBase + j] = pred[sourceBase + j]
+                    }
+                }
             }
         }
     }
 
     /// Recursive (filter) intra prediction (7.11.2.3).
-    private func recursiveIntraPrediction(
-        pred: inout [[Int]],
-        w: Int,
-        h: Int,
-        bitDepth: Int,
-        aboveRow: [Int],
-        leftCol: [Int],
-        offset: Int
-    ) {
+    private func recursiveIntraPrediction(w: Int, h: Int, bitDepth: Int) {
+        let offset = 4
         let taps = AV1Tables.intraFilterTaps[filterIntraMode]
         let w4 = w >> 2
         let h2 = h >> 1
+        var p = (0, 0, 0, 0, 0, 0, 0)
         for i2 in 0..<h2 {
             for j4 in 0..<w4 {
-                var p = [Int](repeating: 0, count: 7)
-                for i in 0..<7 {
-                    if i < 5 {
-                        if i2 == 0 {
-                            p[i] = aboveRow[offset + (j4 << 2) + i - 1]
-                        } else if j4 == 0 && i == 0 {
-                            p[i] = leftCol[offset + (i2 << 1) - 1]
+                withUnsafeMutableBytes(of: &p) { raw in
+                    let neighbors = raw.bindMemory(to: Int.self)
+                    for i in 0..<7 {
+                        if i < 5 {
+                            if i2 == 0 {
+                                neighbors[i] = scratchAbove[offset + (j4 << 2) + i - 1]
+                            } else if j4 == 0 && i == 0 {
+                                neighbors[i] = scratchLeft[offset + (i2 << 1) - 1]
+                            } else {
+                                neighbors[i] = scratchPred[((i2 << 1) - 1) * w + (j4 << 2) + i - 1]
+                            }
                         } else {
-                            p[i] = pred[(i2 << 1) - 1][(j4 << 2) + i - 1]
-                        }
-                    } else {
-                        if j4 == 0 {
-                            p[i] = leftCol[offset + (i2 << 1) + i - 5]
-                        } else {
-                            p[i] = pred[(i2 << 1) + i - 5][(j4 << 2) - 1]
+                            if j4 == 0 {
+                                neighbors[i] = scratchLeft[offset + (i2 << 1) + i - 5]
+                            } else {
+                                neighbors[i] = scratchPred[((i2 << 1) + i - 5) * w + (j4 << 2) - 1]
+                            }
                         }
                     }
-                }
-                for i1 in 0..<2 {
-                    for j1 in 0..<4 {
-                        var pr = 0
-                        for i in 0..<7 {
-                            pr += taps[(i1 << 2) + j1][i] * p[i]
+                    for i1 in 0..<2 {
+                        for j1 in 0..<4 {
+                            var pr = 0
+                            for i in 0..<7 {
+                                pr += taps[(i1 << 2) + j1][i] * neighbors[i]
+                            }
+                            // Round2Signed(pr, INTRA_FILTER_SCALE_BITS = 4)
+                            let rounded = pr >= 0 ? (pr + 8) >> 4 : -((-pr + 8) >> 4)
+                            scratchPred[((i2 << 1) + i1) * w + (j4 << 2) + j1] = Self.clip1(rounded, bitDepth)
                         }
-                        // Round2Signed(pr, INTRA_FILTER_SCALE_BITS = 4)
-                        let rounded = pr >= 0 ? (pr + 8) >> 4 : -((-pr + 8) >> 4)
-                        pred[(i2 << 1) + i1][(j4 << 2) + j1] = Self.clip1(rounded, bitDepth)
                     }
                 }
             }
@@ -253,7 +249,6 @@ extension AV1TileDecoder {
     /// Directional intra prediction with edge filtering and upsampling
     /// (7.11.2.4, 7.11.2.7–12).
     private func directionalIntraPrediction(
-        pred: inout [[Int]],
         plane: Int,
         x: Int,
         y: Int,
@@ -264,11 +259,9 @@ extension AV1TileDecoder {
         h: Int,
         maxX: Int,
         maxY: Int,
-        bitDepth: Int,
-        aboveRow: inout [Int],
-        leftCol: inout [Int],
-        offset: Int
+        bitDepth: Int
     ) {
+        let offset = 4
         let angleDelta = plane == 0 ? angleDeltaY : angleDeltaUV
         let pAngle = AV1Tables.modeToAngle[mode] + angleDelta * 3  // ANGLE_STEP
         var upsampleAbove = false
@@ -277,31 +270,31 @@ extension AV1TileDecoder {
         if sequence.enableIntraEdgeFilter, pAngle != 90, pAngle != 180 {
             if pAngle > 90, pAngle < 180, w + h >= 24 {
                 // Filter corner.
-                let s = leftCol[offset] * 5 + aboveRow[offset - 1] * 6 + aboveRow[offset] * 5
+                let s = scratchLeft[offset] * 5 + scratchAbove[offset - 1] * 6 + scratchAbove[offset] * 5
                 let filtered = (s + 8) >> 4
-                leftCol[offset - 1] = filtered
-                aboveRow[offset - 1] = filtered
+                scratchLeft[offset - 1] = filtered
+                scratchAbove[offset - 1] = filtered
             }
             let filterType = intraFilterType(plane: plane)
             if haveAbove {
                 let strength = Self.edgeFilterStrength(w: w, h: h, filterType: filterType, delta: pAngle - 90)
                 let numPx = min(w, maxX - x + 1) + (pAngle < 90 ? h : 0) + 1
-                Self.intraEdgeFilter(buffer: &aboveRow, offset: offset, size: numPx, strength: strength)
+                Self.intraEdgeFilter(buffer: &scratchAbove, offset: offset, size: numPx, strength: strength)
             }
             if haveLeft {
                 let strength = Self.edgeFilterStrength(w: w, h: h, filterType: filterType, delta: pAngle - 180)
                 let numPx = min(h, maxY - y + 1) + (pAngle > 180 ? w : 0) + 1
-                Self.intraEdgeFilter(buffer: &leftCol, offset: offset, size: numPx, strength: strength)
+                Self.intraEdgeFilter(buffer: &scratchLeft, offset: offset, size: numPx, strength: strength)
             }
             upsampleAbove = Self.useUpsample(w: w, h: h, filterType: filterType, delta: pAngle - 90)
             if upsampleAbove {
                 let numPx = w + (pAngle < 90 ? h : 0)
-                Self.intraEdgeUpsample(buffer: &aboveRow, offset: offset, count: numPx, bitDepth: bitDepth)
+                Self.intraEdgeUpsample(buffer: &scratchAbove, offset: offset, count: numPx, bitDepth: bitDepth)
             }
             upsampleLeft = Self.useUpsample(w: w, h: h, filterType: filterType, delta: pAngle - 180)
             if upsampleLeft {
                 let numPx = h + (pAngle > 180 ? w : 0)
-                Self.intraEdgeUpsample(buffer: &leftCol, offset: offset, count: numPx, bitDepth: bitDepth)
+                Self.intraEdgeUpsample(buffer: &scratchLeft, offset: offset, count: numPx, bitDepth: bitDepth)
             }
         }
 
@@ -315,10 +308,10 @@ extension AV1TileDecoder {
                     let base = (idx >> (6 - upA)) + (j << upA)
                     if base < maxBaseX {
                         let shift = ((idx << upA) >> 1) & 0x1F
-                        let value = aboveRow[offset + base] * (32 - shift) + aboveRow[offset + base + 1] * shift
-                        pred[i][j] = (value + 16) >> 5
+                        let value = scratchAbove[offset + base] * (32 - shift) + scratchAbove[offset + base + 1] * shift
+                        scratchPred[i * w + j] = (value + 16) >> 5
                     } else {
-                        pred[i][j] = aboveRow[offset + maxBaseX]
+                        scratchPred[i * w + j] = scratchAbove[offset + maxBaseX]
                     }
                 }
             }
@@ -333,14 +326,14 @@ extension AV1TileDecoder {
                     let baseA = idxA >> (6 - upA)
                     if baseA >= -(1 << upA) {
                         let shift = ((idxA << upA) >> 1) & 0x1F
-                        let value = aboveRow[offset + baseA] * (32 - shift) + aboveRow[offset + baseA + 1] * shift
-                        pred[i][j] = (value + 16) >> 5
+                        let value = scratchAbove[offset + baseA] * (32 - shift) + scratchAbove[offset + baseA + 1] * shift
+                        scratchPred[i * w + j] = (value + 16) >> 5
                     } else {
                         let idxL = (i << 6) - (j + 1) * dy
                         let baseL = idxL >> (6 - upL)
                         let shift = ((idxL << upL) >> 1) & 0x1F
-                        let value = leftCol[offset + baseL] * (32 - shift) + leftCol[offset + baseL + 1] * shift
-                        pred[i][j] = (value + 16) >> 5
+                        let value = scratchLeft[offset + baseL] * (32 - shift) + scratchLeft[offset + baseL + 1] * shift
+                        scratchPred[i * w + j] = (value + 16) >> 5
                     }
                 }
             }
@@ -352,20 +345,20 @@ extension AV1TileDecoder {
                     let idx = (j + 1) * dy
                     let base = (idx >> (6 - upL)) + (i << upL)
                     let shift = ((idx << upL) >> 1) & 0x1F
-                    let value = leftCol[offset + base] * (32 - shift) + leftCol[offset + base + 1] * shift
-                    pred[i][j] = (value + 16) >> 5
+                    let value = scratchLeft[offset + base] * (32 - shift) + scratchLeft[offset + base + 1] * shift
+                    scratchPred[i * w + j] = (value + 16) >> 5
                 }
             }
         } else if pAngle == 90 {
             for i in 0..<h {
                 for j in 0..<w {
-                    pred[i][j] = aboveRow[offset + j]
+                    scratchPred[i * w + j] = scratchAbove[offset + j]
                 }
             }
         } else {  // pAngle == 180
             for i in 0..<h {
                 for j in 0..<w {
-                    pred[i][j] = leftCol[offset + i]
+                    scratchPred[i * w + j] = scratchLeft[offset + i]
                 }
             }
         }
@@ -490,54 +483,46 @@ extension AV1TileDecoder {
     }
 
     private func dcIntraPrediction(
-        pred: inout [[Int]],
         haveLeft: Bool,
         haveAbove: Bool,
         log2W: Int,
         log2H: Int,
         w: Int,
         h: Int,
-        bitDepth: Int,
-        aboveRow: [Int],
-        leftCol: [Int],
-        offset: Int
+        bitDepth: Int
     ) {
+        let offset = 4
         let value: Int
         if haveLeft && haveAbove {
             var sum = 0
-            for k in 0..<h { sum += leftCol[offset + k] }
-            for k in 0..<w { sum += aboveRow[offset + k] }
+            for k in 0..<h { sum += scratchLeft[offset + k] }
+            for k in 0..<w { sum += scratchAbove[offset + k] }
             sum += (w + h) >> 1
             value = sum / (w + h)
         } else if haveLeft {
             var sum = 0
-            for k in 0..<h { sum += leftCol[offset + k] }
+            for k in 0..<h { sum += scratchLeft[offset + k] }
             value = Self.clip1((sum + (h >> 1)) >> log2H, bitDepth)
         } else if haveAbove {
             var sum = 0
-            for k in 0..<w { sum += aboveRow[offset + k] }
+            for k in 0..<w { sum += scratchAbove[offset + k] }
             value = Self.clip1((sum + (w >> 1)) >> log2W, bitDepth)
         } else {
             value = 1 << (bitDepth - 1)
         }
-        for i in 0..<h {
-            for j in 0..<w {
-                pred[i][j] = value
-            }
+        for i in 0..<(h * w) {
+            scratchPred[i] = value
         }
     }
 
     private func smoothIntraPrediction(
-        pred: inout [[Int]],
         mode: Int,
         log2W: Int,
         log2H: Int,
         w: Int,
-        h: Int,
-        aboveRow: [Int],
-        leftCol: [Int],
-        offset: Int
+        h: Int
     ) {
+        let offset = 4
         func weights(_ log2Size: Int) -> [Int] {
             AV1Tables.smoothWeights[log2Size - 2]
         }
@@ -546,27 +531,27 @@ extension AV1TileDecoder {
             let wy = weights(log2H)
             for i in 0..<h {
                 for j in 0..<w {
-                    let value = wy[i] * aboveRow[offset + j]
-                        + (256 - wy[i]) * leftCol[offset + h - 1]
-                        + wx[j] * leftCol[offset + i]
-                        + (256 - wx[j]) * aboveRow[offset + w - 1]
-                    pred[i][j] = (value + 256) >> 9
+                    let value = wy[i] * scratchAbove[offset + j]
+                        + (256 - wy[i]) * scratchLeft[offset + h - 1]
+                        + wx[j] * scratchLeft[offset + i]
+                        + (256 - wx[j]) * scratchAbove[offset + w - 1]
+                    scratchPred[i * w + j] = (value + 256) >> 9
                 }
             }
         } else if mode == 10 {  // SMOOTH_V_PRED
             let wy = weights(log2H)
             for i in 0..<h {
                 for j in 0..<w {
-                    let value = wy[i] * aboveRow[offset + j] + (256 - wy[i]) * leftCol[offset + h - 1]
-                    pred[i][j] = (value + 128) >> 8
+                    let value = wy[i] * scratchAbove[offset + j] + (256 - wy[i]) * scratchLeft[offset + h - 1]
+                    scratchPred[i * w + j] = (value + 128) >> 8
                 }
             }
         } else {  // SMOOTH_H_PRED
             let wx = weights(log2W)
             for i in 0..<h {
                 for j in 0..<w {
-                    let value = wx[j] * leftCol[offset + i] + (256 - wx[j]) * aboveRow[offset + w - 1]
-                    pred[i][j] = (value + 128) >> 8
+                    let value = wx[j] * scratchLeft[offset + i] + (256 - wx[j]) * scratchAbove[offset + w - 1]
+                    scratchPred[i * w + j] = (value + 128) >> 8
                 }
             }
         }
@@ -673,7 +658,6 @@ extension AV1TileDecoder {
             ? AV1QuantizerMatrices.matrices[qmLevel * 2 + (plane > 0 ? 1 : 0)] : []
         let matrixBase = AV1QuantizerMatrices.offset[txSz]
 
-        var dequant = [Int](repeating: 0, count: tw * th)
         let clampLimit = 1 << (7 + bitDepth)
         for i in 0..<th {
             for j in 0..<tw {
@@ -684,20 +668,29 @@ extension AV1TileDecoder {
                 let dq = quant[i * tw + j] * q
                 let sign = dq < 0 ? -1 : 1
                 let dq2 = sign * ((abs(dq) & 0xFFFFFF) / dqDenom)
-                dequant[i * tw + j] = min(max(dq2, -clampLimit), clampLimit - 1)
+                scratchDequant[i * tw + j] = min(max(dq2, -clampLimit), clampLimit - 1)
             }
         }
 
-        let residual = AV1Transforms.inverse2D(
-            dequant: dequant, txSz: txSz, txType: txType,
-            lossless: lossless, bitDepth: bitDepth
+        AV1Transforms.inverse2D(
+            dequant: scratchDequant, txSz: txSz, txType: txType,
+            lossless: lossless, bitDepth: bitDepth,
+            lane: &scratchLane, residual: &scratchResidual
         )
-        for i in 0..<h {
-            let yy = flipUD ? (h - i - 1) : i
-            for j in 0..<w {
-                let xx = flipLR ? (w - j - 1) : j
-                let value = frame.sample(plane, y + yy, x + xx) + residual[i][j]
-                frame.setSample(plane, y + yy, x + xx, Self.clip1(value, bitDepth))
+        let stride = frame.allocatedWidth[plane]
+        let maxValue = (1 << bitDepth) - 1
+        scratchResidual.withUnsafeBufferPointer { residual in
+            frame.planes[plane].withUnsafeMutableBufferPointer { dest in
+                for i in 0..<h {
+                    let yy = flipUD ? (h - i - 1) : i
+                    let destBase = (y + yy) * stride + x
+                    let sourceBase = i * w
+                    for j in 0..<w {
+                        let xx = flipLR ? (w - j - 1) : j
+                        let value = dest[destBase + xx] + residual[sourceBase + j]
+                        dest[destBase + xx] = min(max(value, 0), maxValue)
+                    }
+                }
             }
         }
     }

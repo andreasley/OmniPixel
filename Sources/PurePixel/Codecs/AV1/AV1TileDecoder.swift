@@ -78,35 +78,50 @@ final class AV1TileDecoder {
     private let sbSize: Int
     /// When set, prediction and reconstruction run inline with the syntax.
     private let frame: AV1FrameBuffer?
+    /// Whether any in-loop filter will run — if not, the per-mi filter
+    /// bookkeeping (mode info, tx sizes, deltas) is dead weight.
+    private let filtersActive: Bool
 
-    private var decoder: AV1SymbolDecoder
-    private var cdf: AV1TileCDFs
+    // Dynamic exclusivity enforcement on these costs a TLS lookup per
+    // decoded symbol; the decoder is strictly single-threaded and never
+    // forms aliasing inout pairs over them.
+    @exclusivity(unchecked) private var decoder: AV1SymbolDecoder
+    @exclusivity(unchecked) private var cdf: AV1TileCDFs
 
     // MARK: Frame-position decoding state
 
-    var yModes: [[UInt8]]
-    var uvModes: [[UInt8]]
-    private var skips: [[Bool]]
-    private var miSizes: [[UInt8]]
-    private var segmentIDs: [[UInt8]]
-    private var interTxSizes: [[UInt8]]
-    private var txTypes: [[UInt8]]
+    @exclusivity(unchecked) var yModes: [[UInt8]]
+    @exclusivity(unchecked) var uvModes: [[UInt8]]
+    @exclusivity(unchecked) private var skips: [[Bool]]
+    @exclusivity(unchecked) private var miSizes: [[UInt8]]
+    @exclusivity(unchecked) private var segmentIDs: [[UInt8]]
+    @exclusivity(unchecked) private var interTxSizes: [[UInt8]]
+    @exclusivity(unchecked) private var txTypes: [[UInt8]]
     /// Coefficient contexts, per plane, indexed by absolute 4-sample units.
-    private var aboveLevelContext: [[UInt8]]
-    private var aboveDcContext: [[UInt8]]
-    private var leftLevelContext: [[UInt8]]
-    private var leftDcContext: [[UInt8]]
+    @exclusivity(unchecked) private var aboveLevelContext: [[UInt8]]
+    @exclusivity(unchecked) private var aboveDcContext: [[UInt8]]
+    @exclusivity(unchecked) private var leftLevelContext: [[UInt8]]
+    @exclusivity(unchecked) private var leftDcContext: [[UInt8]]
     /// CDEF filter strength indices on the 64×64 grid (-1 = not yet coded).
-    private var cdefIndex: [[Int8]]
+    @exclusivity(unchecked) private var cdefIndex: [[Int8]]
+
+    // Reconstruction scratch, reused across transform blocks.
+    @exclusivity(unchecked) var scratchAbove = [Int](repeating: 0, count: 272)
+    @exclusivity(unchecked) var scratchLeft = [Int](repeating: 0, count: 272)
+    @exclusivity(unchecked) var scratchPred = [Int](repeating: 0, count: 64 * 64)
+    @exclusivity(unchecked) var scratchLane = AV1Transforms.Lane()
+    @exclusivity(unchecked) var scratchResidual = [Int](repeating: 0, count: 64 * 64)
+    @exclusivity(unchecked) var scratchDequant = [Int](repeating: 0, count: 1024)
+    @exclusivity(unchecked) var scratchQuant = [Int](repeating: 0, count: 1024)
 
     private var currentQIndex: Int
     private var readDeltas = false
     /// DeltaLF state (reset per tile), stored per mode-info unit for the
     /// deblocking filter.
-    private var currentDeltaLF = [0, 0, 0, 0]
+    @exclusivity(unchecked) private var currentDeltaLF = [0, 0, 0, 0]
     /// Loop-restoration prediction references, reset per tile.
-    private var refLrWiener = [[[Int]]]()
-    private var refSgrXqd = [[Int]]()
+    @exclusivity(unchecked) private var refLrWiener = [[[Int]]]()
+    @exclusivity(unchecked) private var refSgrXqd = [[Int]]()
 
     // MARK: Current block state
 
@@ -131,27 +146,33 @@ final class AV1TileDecoder {
     private var paletteColorsY = [Int]()
     private var paletteColorsU = [Int]()
     private var paletteColorsV = [Int]()
-    private var colorMapY = [[Int]]()
-    private var colorMapUV = [[Int]]()
+    /// Flat color-index maps of the current block (stride = the stored
+    /// width), plus reused scratch for the per-sample color context.
+    @exclusivity(unchecked) private var colorMapY = [Int]()
+    private var colorMapYWidth = 0
+    @exclusivity(unchecked) private var colorMapUV = [Int]()
+    private var colorMapUVWidth = 0
+    @exclusivity(unchecked) private var paletteScores = [Int](repeating: 0, count: 8)
+    @exclusivity(unchecked) private var paletteOrder = [Int](repeating: 0, count: 8)
     /// Neighbor palettes for the cache and contexts (Y and U only),
     /// allocated when screen-content tools are on.
-    private var paletteSizes = [[[UInt8]]]()
-    private var paletteStore = [[UInt16]]()
+    @exclusivity(unchecked) private var paletteSizes = [[[UInt8]]]()
+    @exclusivity(unchecked) private var paletteStore = [[UInt16]]()
     /// Intra block copy state: current block's inter flag and displacement
     /// vector (row, col in 1/8 luma samples), plus per-mi records.
     private var blockIsInter = false
     private var blockMvRow = 0
     private var blockMvCol = 0
-    private var isInters: [[Bool]]
-    private var mvRowsGrid: [[Int32]]
-    private var mvColsGrid: [[Int32]]
-    private var decodedMi: [[Bool]]
+    @exclusivity(unchecked) private var isInters: [[Bool]]
+    @exclusivity(unchecked) private var mvRowsGrid: [[Int32]]
+    @exclusivity(unchecked) private var mvColsGrid: [[Int32]]
+    @exclusivity(unchecked) private var decodedMi: [[Bool]]
     private(set) var intraBlockCopyCount = 0
     /// The extent of decoded luma in the current block, for CfL.
     var maxLumaW = 0, maxLumaH = 0
     /// Per-superblock decoded flags per plane, offset by 1 in each axis so
     /// index -1 is representable (clear_block_decoded_flags).
-    private var blockDecoded = [[[Bool]]]()
+    @exclusivity(unchecked) private var blockDecoded = [[[Bool]]]()
 
     init(
         tile bytes: [UInt8],
@@ -164,6 +185,9 @@ final class AV1TileDecoder {
         self.sequence = sequence
         self.header = header
         self.frame = frame
+        filtersActive = header.loopFilterLevel.contains(where: { $0 != 0 })
+            || (sequence.enableCDEF && !header.codedLossless && !header.allowIntrabc)
+            || header.restorationType.contains(where: { $0 != 0 })
         miRows = header.miRows
         miCols = header.miCols
         miRowStart = header.tiles.miRowStarts[tileRow]
@@ -651,20 +675,27 @@ final class AV1TileDecoder {
                 skips[r + y][c + x] = blockSkip
                 miSizes[r + y][c + x] = UInt8(miSize)
                 segmentIDs[r + y][c + x] = UInt8(segmentID)
-                isInters[r + y][c + x] = blockIsInter
-                mvRowsGrid[r + y][c + x] = Int32(blockMvRow)
-                mvColsGrid[r + y][c + x] = Int32(blockMvCol)
+                // Each mode-info unit is written exactly once per frame,
+                // so zero (initial) values need no store.
+                if blockIsInter {
+                    isInters[r + y][c + x] = true
+                    mvRowsGrid[r + y][c + x] = Int32(blockMvRow)
+                    mvColsGrid[r + y][c + x] = Int32(blockMvCol)
+                }
                 decodedMi[r + y][c + x] = true
-                if let frame {
+                if let frame, filtersActive {
                     frame.yModes[r + y][c + x] = UInt8(yMode)
                     frame.skips[r + y][c + x] = blockSkip
                     frame.miSizes[r + y][c + x] = UInt8(miSize)
                     frame.segmentIDs[r + y][c + x] = UInt8(segmentID)
-                    for i in 0..<4 {
-                        frame.deltaLFs[r + y][c + x][i] = Int8(currentDeltaLF[i])
+                    if header.deltaLFPresent {
+                        let base = ((r + y) * miCols + c + x) * 4
+                        for i in 0..<4 {
+                            frame.deltaLFs[base + i] = Int8(currentDeltaLF[i])
+                        }
                     }
                 }
-                if !paletteSizes.isEmpty {
+                if paletteSizeY > 0 || paletteSizeUV > 0 {
                     paletteSizes[0][r + y][c + x] = UInt8(paletteSizeY)
                     paletteSizes[1][r + y][c + x] = UInt8(paletteSizeUV)
                     let base = ((r + y) * miCols + c + x) * 8
@@ -677,6 +708,7 @@ final class AV1TileDecoder {
                 }
             }
         }
+        guard frame == nil else { return }
         blocks.append(BlockInfo(
             miRow: r, miCol: c, size: blockSize, skip: blockSkip,
             yMode: yMode, uvMode: uvMode,
@@ -1098,6 +1130,8 @@ final class AV1TileDecoder {
     private func paletteTokens() {
         colorMapY = []
         colorMapUV = []
+        colorMapYWidth = 0
+        colorMapUVWidth = 0
         if paletteSizeY > 0 || paletteSizeUV > 0 {
             paletteBlockCount += 1
         }
@@ -1111,6 +1145,7 @@ final class AV1TileDecoder {
                 onscreenWidth: onscreenWidth, onscreenHeight: onscreenHeight,
                 paletteSize: paletteSizeY, luma: true
             )
+            colorMapYWidth = blockWidth
         }
         if paletteSizeUV > 0 {
             var blockWidth = (4 * bw4) >> chromaSubX
@@ -1130,6 +1165,7 @@ final class AV1TileDecoder {
                 onscreenWidth: onscreenWidth, onscreenHeight: onscreenHeight,
                 paletteSize: paletteSizeUV, luma: false
             )
+            colorMapUVWidth = blockWidth
         }
     }
 
@@ -1137,31 +1173,33 @@ final class AV1TileDecoder {
         blockWidth: Int, blockHeight: Int,
         onscreenWidth: Int, onscreenHeight: Int,
         paletteSize: Int, luma: Bool
-    ) -> [[Int]] {
-        var map = [[Int]](repeating: [Int](repeating: 0, count: blockWidth), count: blockHeight)
-        map[0][0] = readNonSymmetricBool(paletteSize)
+    ) -> [Int] {
+        var map = [Int](repeating: 0, count: blockHeight * blockWidth)
+        map[0] = readNonSymmetricBool(paletteSize)
         for i in 1..<(onscreenHeight + onscreenWidth - 1) {
             var j = min(i, onscreenWidth - 1)
             while j >= max(0, i - onscreenHeight + 1) {
-                let (context, order) = Self.paletteColorContext(map: map, r: i - j, c: j, n: paletteSize)
+                let context = paletteColorContext(map: map, width: blockWidth, r: i - j, c: j, n: paletteSize)
                 let symbol: Int
                 if luma {
                     symbol = decoder.readSymbol(&cdf.paletteYColor[paletteSize - 2][context])
                 } else {
                     symbol = decoder.readSymbol(&cdf.paletteUVColor[paletteSize - 2][context])
                 }
-                map[i - j][j] = order[symbol]
+                map[(i - j) * blockWidth + j] = paletteOrder[symbol]
                 j -= 1
             }
         }
         for i in 0..<onscreenHeight {
+            let value = map[i * blockWidth + onscreenWidth - 1]
             for j in onscreenWidth..<blockWidth {
-                map[i][j] = map[i][onscreenWidth - 1]
+                map[i * blockWidth + j] = value
             }
         }
         for i in onscreenHeight..<blockHeight {
+            let sourceBase = (onscreenHeight - 1) * blockWidth
             for j in 0..<blockWidth {
-                map[i][j] = map[onscreenHeight - 1][j]
+                map[i * blockWidth + j] = map[sourceBase + j]
             }
         }
         return map
@@ -1171,44 +1209,49 @@ final class AV1TileDecoder {
     /// score hash picks the CDF context.
     private static let paletteColorContextTable = [-1, -1, 0, -1, -1, 4, 3, 2, 1]
 
-    private static func paletteColorContext(map: [[Int]], r: Int, c: Int, n: Int) -> (context: Int, order: [Int]) {
-        var scores = [Int](repeating: 0, count: 8)  // PALETTE_COLORS
-        var order = Array(0..<8)
+    /// Fills `paletteOrder` with the ranked colors and returns the CDF
+    /// context. Runs once per palette sample, so it works on reused
+    /// scratch instead of allocating.
+    private func paletteColorContext(map: [Int], width: Int, r: Int, c: Int, n: Int) -> Int {
+        for i in 0..<8 {  // PALETTE_COLORS
+            paletteScores[i] = 0
+            paletteOrder[i] = i
+        }
         if c > 0 {
-            scores[map[r][c - 1]] += 2
+            paletteScores[map[r * width + c - 1]] += 2
         }
         if r > 0, c > 0 {
-            scores[map[r - 1][c - 1]] += 1
+            paletteScores[(map[(r - 1) * width + c - 1])] += 1
         }
         if r > 0 {
-            scores[map[r - 1][c]] += 2
+            paletteScores[map[(r - 1) * width + c]] += 2
         }
         for i in 0..<3 {  // PALETTE_NUM_NEIGHBORS
-            var maxScore = scores[i]
+            var maxScore = paletteScores[i]
             var maxIdx = i
             var j = i + 1
             while j < n {
-                if scores[j] > maxScore {
-                    maxScore = scores[j]
+                if paletteScores[j] > maxScore {
+                    maxScore = paletteScores[j]
                     maxIdx = j
                 }
                 j += 1
             }
             if maxIdx != i {
-                let maxOrder = order[maxIdx]
+                let maxOrder = paletteOrder[maxIdx]
                 var k = maxIdx
                 while k > i {
-                    scores[k] = scores[k - 1]
-                    order[k] = order[k - 1]
+                    paletteScores[k] = paletteScores[k - 1]
+                    paletteOrder[k] = paletteOrder[k - 1]
                     k -= 1
                 }
-                scores[i] = maxScore
-                order[i] = maxOrder
+                paletteScores[i] = maxScore
+                paletteOrder[i] = maxOrder
             }
         }
         // Palette_Color_Hash_Multipliers = [1, 2, 2]
-        let hash = scores[0] + 2 * scores[1] + 2 * scores[2]
-        return (Self.paletteColorContextTable[hash], order)
+        let hash = paletteScores[0] + 2 * paletteScores[1] + 2 * paletteScores[2]
+        return Self.paletteColorContextTable[hash]
     }
 
     private func filterIntraModeInfo() {
@@ -1541,7 +1584,7 @@ final class AV1TileDecoder {
         }
 
         if !blockSkip {
-            let (eob, txType, quant) = try coefficients(plane: plane, startX: startX, startY: startY, txSz: txSz)
+            let (eob, txType) = try coefficients(plane: plane, startX: startX, startY: startY, txSz: txSz)
             if eob > 0, let frame {
                 let qmLevel: Int
                 if lossless {
@@ -1551,7 +1594,7 @@ final class AV1TileDecoder {
                 }
                 reconstruct(
                     frame: frame, plane: plane, x: startX, y: startY,
-                    txSz: txSz, txType: txType, quant: quant,
+                    txSz: txSz, txType: txType, quant: scratchQuant,
                     lossless: lossless, qIndexBase: blockQIndex, qmLevel: qmLevel
                 )
             }
@@ -1563,12 +1606,14 @@ final class AV1TileDecoder {
                     blockDecoded[plane][subBlockMiRow + i + 1][subBlockMiCol + j + 1] = true
                 }
             }
-            let x4 = startX >> 2
-            let y4 = startY >> 2
-            let sizes = frame.loopfilterTxSizes[plane]
-            for i in 0..<stepY where y4 + i < sizes.count {
-                for j in 0..<stepX where x4 + j < sizes[0].count {
-                    frame.loopfilterTxSizes[plane][y4 + i][x4 + j] = UInt8(txSz)
+            if filtersActive {
+                let x4 = startX >> 2
+                let y4 = startY >> 2
+                let sizes = frame.loopfilterTxSizes[plane]
+                for i in 0..<stepY where y4 + i < sizes.count {
+                    for j in 0..<stepX where x4 + j < sizes[0].count {
+                        frame.loopfilterTxSizes[plane][y4 + i][x4 + j] = UInt8(txSz)
+                    }
                 }
             }
         }
@@ -1585,9 +1630,11 @@ final class AV1TileDecoder {
         default: palette = paletteColorsV
         }
         let map = plane == 0 ? colorMapY : colorMapUV
+        let mapWidth = plane == 0 ? colorMapYWidth : colorMapUVWidth
         for i in 0..<h {
+            let mapBase = (y * 4 + i) * mapWidth + x * 4
             for j in 0..<w {
-                frame.setSample(plane, startY + i, startX + j, palette[map[y * 4 + i][x * 4 + j]])
+                frame.setSample(plane, startY + i, startX + j, palette[map[mapBase + j]])
             }
         }
     }
@@ -1872,7 +1919,7 @@ final class AV1TileDecoder {
     @discardableResult
     private func coefficients(
         plane: Int, startX: Int, startY: Int, txSz: Int
-    ) throws -> (eob: Int, txType: Int, quant: [Int]) {
+    ) throws -> (eob: Int, txType: Int) {
         let x4 = startX >> 2
         let y4 = startY >> 2
         let w4 = AV1Tables.txWidth[txSz] >> 2
@@ -1880,7 +1927,9 @@ final class AV1TileDecoder {
         let txSzCtx = (AV1Tables.txSizeSqr[txSz] + AV1Tables.txSizeSqrUp[txSz] + 1) >> 1
         let ptype = plane > 0 ? 1 : 0
         let segEob = (txSz == 17 || txSz == 18) ? 512 : min(1024, AV1Tables.txWidth[txSz] * AV1Tables.txHeight[txSz])
-        var quant = [Int](repeating: 0, count: segEob)
+        for i in 0..<segEob {
+            scratchQuant[i] = 0
+        }
         var eob = 0
         var culLevel = 0
         var dcCategory = 0
@@ -1950,13 +1999,13 @@ final class AV1TileDecoder {
                 } else {
                     let context = coeffBaseCtx(
                         txSz: txSz, pos: pos, bwl: bwl, width: 1 << bwl, height: adjHeight,
-                        txClass: txClass, quant: quant
+                        txClass: txClass, quant: scratchQuant
                     )
                     level = decoder.readSymbol(&cdf.coeffBase[(txSzCtx * 2 + ptype) * 42 + context])
                 }
                 if level > Self.numBaseLevels {
                     for _ in 0..<(Self.coeffBaseRange / (Self.brCDFSize - 1)) {
-                        let context = coeffBrCtx(pos: pos, bwl: bwl, txClass: txClass, adjTxSz: adjTxSz, quant: quant)
+                        let context = coeffBrCtx(pos: pos, bwl: bwl, txClass: txClass, adjTxSz: adjTxSz, quant: scratchQuant)
                         let br = decoder.readSymbol(&cdf.coeffBr[(min(txSzCtx, 3) * 2 + ptype) * 21 + context])
                         level += br
                         if br < Self.brCDFSize - 1 {
@@ -1964,7 +2013,7 @@ final class AV1TileDecoder {
                         }
                     }
                 }
-                quant[pos] = level
+                scratchQuant[pos] = level
                 c -= 1
             }
 
@@ -1972,14 +2021,14 @@ final class AV1TileDecoder {
             for c in 0..<eob {
                 let pos = scan[c]
                 var sign = 0
-                if quant[pos] != 0 {
+                if scratchQuant[pos] != 0 {
                     if c == 0 {
                         sign = decoder.readSymbol(&cdf.dcSign[ptype * 3 + dcSignCtx(plane: plane, x4: x4, y4: y4, w4: w4, h4: h4)])
                     } else {
                         sign = decoder.readLiteral(1)
                     }
                 }
-                if quant[pos] > Self.numBaseLevels + Self.coeffBaseRange {
+                if scratchQuant[pos] > Self.numBaseLevels + Self.coeffBaseRange {
                     var length = 0
                     repeat {
                         length += 1
@@ -1991,15 +2040,15 @@ final class AV1TileDecoder {
                     for _ in 0..<(length - 1) {
                         value = value << 1 | decoder.readLiteral(1)
                     }
-                    quant[pos] = value + Self.coeffBaseRange + Self.numBaseLevels
+                    scratchQuant[pos] = value + Self.coeffBaseRange + Self.numBaseLevels
                 }
-                if pos == 0, quant[pos] > 0 {
+                if pos == 0, scratchQuant[pos] > 0 {
                     dcCategory = sign != 0 ? 1 : 2
                 }
-                quant[pos] &= 0xFFFFF
-                culLevel += quant[pos]
+                scratchQuant[pos] &= 0xFFFFF
+                culLevel += scratchQuant[pos]
                 if sign != 0 {
-                    quant[pos] = -quant[pos]
+                    scratchQuant[pos] = -scratchQuant[pos]
                 }
             }
             culLevel = min(63, culLevel)
@@ -2017,13 +2066,15 @@ final class AV1TileDecoder {
             leftDcContext[plane][y4 + i] = UInt8(dcCategory)
         }
 
-        if eob > 0 {
+        if eob > 0, frame == nil {
+            // Recording is for syntax analysis; production decode consumes
+            // the scratch directly.
             transformBlocks.append(TransformBlock(
                 plane: plane, x: startX, y: startY, txSize: txSz,
-                txType: planeTxType, eob: eob, quant: quant
+                txType: planeTxType, eob: eob, quant: Array(scratchQuant[0..<segEob])
             ))
         }
-        return (eob, planeTxType, quant)
+        return (eob, planeTxType)
     }
 
     // MARK: Transform types (5.11.47–48)

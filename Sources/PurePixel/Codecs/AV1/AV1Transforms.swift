@@ -37,12 +37,21 @@ enum AV1Transforms {
         n == 0 ? x : (x + (1 << (n - 1))) >> n
     }
 
-    private static func brev(_ numBits: Int, _ x: Int) -> Int {
-        var t = 0
-        for i in 0..<numBits {
-            t += ((x >> i) & 1) << (numBits - 1 - i)
+    /// Bit reversals, precomputed per width (brev is on every butterfly's
+    /// index path).
+    private static let brevTables: [[Int]] = (0...6).map { numBits in
+        (0..<(1 << numBits)).map { x in
+            var t = 0
+            for i in 0..<numBits {
+                t += ((x >> i) & 1) << (numBits - 1 - i)
+            }
+            return t
         }
-        return t
+    }
+
+    @inline(__always)
+    private static func brev(_ numBits: Int, _ x: Int) -> Int {
+        brevTables[numBits][x]
     }
 
     /// The working array shared by the 1D transforms.
@@ -328,15 +337,17 @@ enum AV1Transforms {
     private static let columnFamily = [0, 1, 0, 1, 1, 0, 1, 1, 1, 2, 0, 2, 1, 2, 1, 2]
 
     /// 2D inverse transform process (7.13.3): consumes the dequantized
-    /// coefficients (tw × th, ≤ 32 per axis, in raster order) and returns
-    /// the h × w residual.
+    /// coefficients (tw × th, ≤ 32 per axis, in raster order) and fills the
+    /// caller's flat h × w residual scratch (stride w).
     static func inverse2D(
         dequant: [Int],
         txSz: Int,
         txType: Int,
         lossless: Bool,
-        bitDepth: Int
-    ) -> [[Int]] {
+        bitDepth: Int,
+        lane: inout Lane,
+        residual: inout [Int]
+    ) {
         let log2W = AV1Tables.txWidthLog2[txSz]
         let log2H = AV1Tables.txHeightLog2[txSz]
         let w = 1 << log2W
@@ -347,9 +358,6 @@ enum AV1Transforms {
         let rowClampRange = bitDepth + 8
         let colClampRange = max(bitDepth + 6, 16)
         let rectangular = abs(log2W - log2H) == 1
-
-        var residual = [[Int]](repeating: [Int](repeating: 0, count: w), count: h)
-        var lane = Lane()
 
         for i in 0..<h {
             for j in 0..<w {
@@ -372,13 +380,13 @@ enum AV1Transforms {
             let clampLimit = 1 << (colClampRange - 1)
             for j in 0..<w {
                 let value = round2(lane.t[j], rowShift)
-                residual[i][j] = min(max(value, -clampLimit), clampLimit - 1)
+                residual[i * w + j] = min(max(value, -clampLimit), clampLimit - 1)
             }
         }
 
         for j in 0..<w {
             for i in 0..<h {
-                lane.t[i] = residual[i][j]
+                lane.t[i] = residual[i * w + j]
             }
             if lossless {
                 lane.inverseWHT(shift: 0)
@@ -390,9 +398,8 @@ enum AV1Transforms {
                 }
             }
             for i in 0..<h {
-                residual[i][j] = round2(lane.t[i], colShift)
+                residual[i * w + j] = round2(lane.t[i], colShift)
             }
         }
-        return residual
     }
 }

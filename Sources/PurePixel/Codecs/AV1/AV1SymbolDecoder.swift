@@ -143,15 +143,23 @@ struct AV1SymbolDecoder {
         symbolMaxBits -= bits
     }
 
-    /// f(n): MSB-first bits; callers never request beyond the buffer
-    /// because symbolMaxBits caps the reads.
+    /// f(n): MSB-first bits (count ≤ 15); callers never request beyond the
+    /// buffer because symbolMaxBits caps the reads. Reads up to four bytes
+    /// at once instead of bit-by-bit.
     private mutating func readBits(_ count: Int) -> Int {
-        var value = 0
-        for _ in 0..<count {
-            value = value << 1 | bit(at: bitPosition)
-            bitPosition += 1
+        guard count > 0 else { return 0 }
+        let byteIndex = bitPosition >> 3
+        let bitOffset = bitPosition & 7
+        var word = 0
+        let end = min(bytes.count, byteIndex + 4)
+        var i = byteIndex
+        while i < end {
+            word = word << 8 | Int(bytes[i])
+            i += 1
         }
-        return value
+        word <<= 8 * (byteIndex + 4 - end)
+        bitPosition += count
+        return (word >> (32 - bitOffset - count)) & ((1 << count) - 1)
     }
 
     private func bit(at position: Int) -> Int {
