@@ -369,6 +369,61 @@ struct AVIFTests {
         }
         #expect(maxAlphaDiff <= 8, "alpha diverges by \(maxAlphaDiff)")
 
+        // Palette: screen content codes flat-color blocks with palettes
+        // (intra block copy disabled — not supported). Validated
+        // sample-exactly against avifdec during bring-up.
+        var screenSource = Image(width: 64, height: 48)
+        let screenColors = [
+            RGBA(red: 255, green: 255, blue: 255), RGBA(red: 0, green: 0, blue: 0),
+            RGBA(red: 200, green: 30, blue: 30), RGBA(red: 30, green: 90, blue: 200),
+        ]
+        for y in 0..<48 {
+            for x in 0..<64 {
+                let quadrant = (x >= 32 ? 1 : 0) + (y >= 24 ? 2 : 0)
+                screenSource[x, y] = screenColors[quadrant]
+            }
+        }
+        // Speckles keep the encoder from lumping everything into one block.
+        var speckle = 12345
+        for _ in 0..<150 {
+            speckle = (speckle &* 1103515245 &+ 12345) & 0x7FFFFFFF
+            let x = speckle % 64
+            let y = (speckle >> 8) % 48
+            screenSource[x, y] = screenColors[(x + y) % 4]
+        }
+        let screenPNG = directory.appendingPathComponent("purepixel-avif-screen.png")
+        try screenSource.encoded(as: .png).write(to: screenPNG)
+        let screenURL = directory.appendingPathComponent("purepixel-avif-screen.avif")
+        try? FileManager.default.removeItem(at: screenURL)
+        let screenProcess = Process()
+        screenProcess.executableURL = URL(fileURLWithPath: encoder)
+        screenProcess.arguments = [
+            "-q", "85", "-y", "444",
+            "-a", "tune-content=screen", "-a", "enable-intrabc=0",
+            screenPNG.path, screenURL.path,
+        ]
+        screenProcess.standardOutput = Pipe()
+        screenProcess.standardError = Pipe()
+        try screenProcess.run()
+        screenProcess.waitUntilExit()
+        try #require(screenProcess.terminationStatus == 0)
+        let screenData = try Data(contentsOf: screenURL)
+        let screenStream = try AVIFCodec.parseStream(from: screenData)
+        #expect(screenStream.frameHeader.allowScreenContentTools)
+        let screenDecoders = try AVIFCodec.decodeTiles(stream: screenStream)
+        #expect(screenDecoders.map(\.paletteBlockCount).reduce(0, +) > 0, "expected the encoder to use palette blocks")
+        let screenImage = try Image(data: screenData)
+        #expect(screenImage.width == 64)
+        // Flat quadrant colors survive palette coding almost exactly
+        // (small differences come from the RGB conversion only).
+        for (point, expected) in [((8, 8), screenColors[0]), ((40, 8), screenColors[1]),
+                                  ((8, 30), screenColors[2]), ((40, 30), screenColors[3])] {
+            let pixel = screenImage[point.0, point.1]
+            #expect(abs(Int(pixel.red) - Int(expected.red)) <= 4)
+            #expect(abs(Int(pixel.green) - Int(expected.green)) <= 4)
+            #expect(abs(Int(pixel.blue) - Int(expected.blue)) <= 4)
+        }
+
         // Grid: a multi-item tiled AVIF composites to the declared size.
         var gridSource = Image(width: 128, height: 96)
         for y in 0..<96 {

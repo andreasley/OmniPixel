@@ -50,6 +50,8 @@ final class AV1TileDecoder {
     private(set) var blocks: [BlockInfo] = []
     private(set) var transformBlocks: [TransformBlock] = []
     private(set) var restorationUnits: [RestorationUnit] = []
+    /// Blocks that coded a luma or chroma palette.
+    private(set) var paletteBlockCount = 0
 
     // MARK: Constants
 
@@ -123,6 +125,18 @@ final class AV1TileDecoder {
     var useFilterIntra = false
     var filterIntraMode = 0
     private var txSize = 0
+    /// Palette state of the current block (sizes 0 = no palette).
+    private(set) var paletteSizeY = 0
+    private(set) var paletteSizeUV = 0
+    private var paletteColorsY = [Int]()
+    private var paletteColorsU = [Int]()
+    private var paletteColorsV = [Int]()
+    private var colorMapY = [[Int]]()
+    private var colorMapUV = [[Int]]()
+    /// Neighbor palettes for the cache and contexts (Y and U only),
+    /// allocated when screen-content tools are on.
+    private var paletteSizes = [[[UInt8]]]()
+    private var paletteStore = [[UInt16]]()
     /// The extent of decoded luma in the current block, for CfL.
     var maxLumaW = 0, maxLumaH = 0
     /// Per-superblock decoded flags per plane, offset by 1 in each axis so
@@ -183,6 +197,16 @@ final class AV1TileDecoder {
             repeating: [Int8](repeating: -1, count: (miCols + 15) >> 4),
             count: (miRows + 15) >> 4
         )
+        if header.allowScreenContentTools {
+            paletteSizes = [[[UInt8]]](
+                repeating: [[UInt8]](repeating: [UInt8](repeating: 0, count: miCols), count: miRows),
+                count: 2
+            )
+            paletteStore = [[UInt16]](
+                repeating: [UInt16](repeating: 0, count: miRows * miCols * 8),
+                count: 2
+            )
+        }
         currentQIndex = header.baseQIndex
     }
 
@@ -594,6 +618,7 @@ final class AV1TileDecoder {
         }
 
         try intraFrameModeInfo()
+        paletteTokens()
         try readBlockTxSize()
         if blockSkip {
             resetBlockContext()
@@ -616,6 +641,17 @@ final class AV1TileDecoder {
                     frame.segmentIDs[r + y][c + x] = UInt8(segmentID)
                     for i in 0..<4 {
                         frame.deltaLFs[r + y][c + x][i] = Int8(currentDeltaLF[i])
+                    }
+                }
+                if !paletteSizes.isEmpty {
+                    paletteSizes[0][r + y][c + x] = UInt8(paletteSizeY)
+                    paletteSizes[1][r + y][c + x] = UInt8(paletteSizeUV)
+                    let base = ((r + y) * miCols + c + x) * 8
+                    for i in 0..<paletteSizeY {
+                        paletteStore[0][base + i] = UInt16(paletteColorsY[i])
+                    }
+                    for i in 0..<paletteSizeUV {
+                        paletteStore[1][base + i] = UInt16(paletteColorsU[i])
                     }
                 }
             }
@@ -666,6 +702,11 @@ final class AV1TileDecoder {
         angleDeltaUV = 0
         cflAlphaU = 0
         cflAlphaV = 0
+        paletteSizeY = 0
+        paletteSizeUV = 0
+        paletteColorsY = []
+        paletteColorsU = []
+        paletteColorsV = []
         if hasChroma {
             let blockW = 4 * bw4
             let blockH = 4 * bh4
@@ -690,7 +731,7 @@ final class AV1TileDecoder {
 
         if miSize >= Self.block8x8, 4 * bw4 <= 64, 4 * bh4 <= 64,
            header.allowScreenContentTools {
-            try paletteModeInfo()
+            paletteModeInfo()
         }
         filterIntraModeInfo()
     }
@@ -873,22 +914,262 @@ final class AV1TileDecoder {
         }
     }
 
-    private func paletteModeInfo() throws {
+    // MARK: Palette (5.11.46, 5.11.49–50)
+
+    private func paletteModeInfo() {
         let bsizeContext = AV1Tables.miWidthLog2[miSize] + AV1Tables.miHeightLog2[miSize] - 2
+        let bitDepth = sequence.bitDepth
         if yMode == Self.dcPred {
-            // Neighboring palette sizes are always zero because a nonzero
-            // palette aborts decoding below, so the context is always 0.
-            let hasPaletteY = decoder.readSymbol(&cdf.paletteYMode[bsizeContext * 3])
-            if hasPaletteY != 0 {
-                throw ImageError.unsupportedFeature(reason: "AV1 palette mode is not supported yet")
+            var context = 0
+            if availU, paletteSizes[0][miRow - 1][miCol] > 0 {
+                context += 1
+            }
+            if availL, paletteSizes[0][miRow][miCol - 1] > 0 {
+                context += 1
+            }
+            if decoder.readSymbol(&cdf.paletteYMode[bsizeContext * 3 + context]) == 1 {
+                paletteSizeY = decoder.readSymbol(&cdf.paletteYSize[bsizeContext]) + 2
+                var colors = [Int]()
+                for cached in paletteCache(plane: 0) where colors.count < paletteSizeY {
+                    if decoder.readLiteral(1) == 1 {
+                        colors.append(cached)
+                    }
+                }
+                if colors.count < paletteSizeY {
+                    colors.append(decoder.readLiteral(bitDepth))
+                }
+                if colors.count < paletteSizeY {
+                    var paletteBits = bitDepth - 3 + decoder.readLiteral(2)
+                    while colors.count < paletteSizeY {
+                        let delta = decoder.readLiteral(paletteBits) + 1
+                        let value = min(colors[colors.count - 1] + delta, (1 << bitDepth) - 1)
+                        colors.append(value)
+                        let range = (1 << bitDepth) - value - 1
+                        paletteBits = min(paletteBits, Self.ceilLog2(range))
+                    }
+                }
+                paletteColorsY = colors.sorted()
             }
         }
         if hasChroma, uvMode == Self.dcPred {
-            let hasPaletteUV = decoder.readSymbol(&cdf.paletteUVMode[0])
-            if hasPaletteUV != 0 {
-                throw ImageError.unsupportedFeature(reason: "AV1 palette mode is not supported yet")
+            let uvContext = paletteSizeY > 0 ? 1 : 0
+            if decoder.readSymbol(&cdf.paletteUVMode[uvContext]) == 1 {
+                paletteSizeUV = decoder.readSymbol(&cdf.paletteUVSize[bsizeContext]) + 2
+                // U colors: cache + ascending deltas, like luma (but the
+                // delta range keeps one more value).
+                var uColors = [Int]()
+                for cached in paletteCache(plane: 1) where uColors.count < paletteSizeUV {
+                    if decoder.readLiteral(1) == 1 {
+                        uColors.append(cached)
+                    }
+                }
+                if uColors.count < paletteSizeUV {
+                    uColors.append(decoder.readLiteral(bitDepth))
+                }
+                if uColors.count < paletteSizeUV {
+                    var paletteBits = bitDepth - 3 + decoder.readLiteral(2)
+                    while uColors.count < paletteSizeUV {
+                        let delta = decoder.readLiteral(paletteBits)
+                        let value = min(uColors[uColors.count - 1] + delta, (1 << bitDepth) - 1)
+                        uColors.append(value)
+                        let range = (1 << bitDepth) - value
+                        paletteBits = min(paletteBits, Self.ceilLog2(range))
+                    }
+                }
+                paletteColorsU = uColors.sorted()
+                // V colors: wrapping signed deltas or raw values.
+                var vColors = [Int]()
+                if decoder.readLiteral(1) == 1 {
+                    let paletteBits = bitDepth - 4 + decoder.readLiteral(2)
+                    let maxValue = 1 << bitDepth
+                    vColors.append(decoder.readLiteral(bitDepth))
+                    for _ in 1..<paletteSizeUV {
+                        var delta = decoder.readLiteral(paletteBits)
+                        if delta != 0, decoder.readLiteral(1) == 1 {
+                            delta = -delta
+                        }
+                        var value = vColors[vColors.count - 1] + delta
+                        if value < 0 { value += maxValue }
+                        if value >= maxValue { value -= maxValue }
+                        vColors.append(min(max(value, 0), maxValue - 1))
+                    }
+                } else {
+                    for _ in 0..<paletteSizeUV {
+                        vColors.append(decoder.readLiteral(bitDepth))
+                    }
+                }
+                paletteColorsV = vColors
             }
         }
+    }
+
+    /// get_palette_cache: the merged, deduplicated colors of the above
+    /// (same 64-row stripe) and left neighbors, ascending.
+    private func paletteCache(plane: Int) -> [Int] {
+        var above = [Int]()
+        if (miRow * 4) % 64 != 0 {
+            let count = Int(paletteSizes[plane][miRow - 1][miCol])
+            let base = ((miRow - 1) * miCols + miCol) * 8
+            above = (0..<count).map { Int(paletteStore[plane][base + $0]) }
+        }
+        var left = [Int]()
+        if availL {
+            let count = Int(paletteSizes[plane][miRow][miCol - 1])
+            let base = (miRow * miCols + miCol - 1) * 8
+            left = (0..<count).map { Int(paletteStore[plane][base + $0]) }
+        }
+        var cache = [Int]()
+        var aboveIdx = 0
+        var leftIdx = 0
+        func push(_ value: Int) {
+            if cache.last != value {
+                cache.append(value)
+            }
+        }
+        while aboveIdx < above.count, leftIdx < left.count {
+            if left[leftIdx] < above[aboveIdx] {
+                push(left[leftIdx])
+                leftIdx += 1
+            } else {
+                if left[leftIdx] == above[aboveIdx] {
+                    leftIdx += 1
+                }
+                push(above[aboveIdx])
+                aboveIdx += 1
+            }
+        }
+        while aboveIdx < above.count {
+            push(above[aboveIdx])
+            aboveIdx += 1
+        }
+        while leftIdx < left.count {
+            push(left[leftIdx])
+            leftIdx += 1
+        }
+        return cache
+    }
+
+    private static func ceilLog2(_ value: Int) -> Int {
+        guard value > 1 else { return 0 }
+        return Int.bitWidth - (value - 1).leadingZeroBitCount
+    }
+
+    /// palette_tokens: the per-sample color index maps, read in wavefront
+    /// (anti-diagonal) order with neighbor-ranked contexts.
+    private func paletteTokens() {
+        colorMapY = []
+        colorMapUV = []
+        if paletteSizeY > 0 || paletteSizeUV > 0 {
+            paletteBlockCount += 1
+        }
+        if paletteSizeY > 0 {
+            let blockWidth = 4 * bw4
+            let blockHeight = 4 * bh4
+            let onscreenWidth = min(blockWidth, (miCols - miCol) * 4)
+            let onscreenHeight = min(blockHeight, (miRows - miRow) * 4)
+            colorMapY = readColorMap(
+                blockWidth: blockWidth, blockHeight: blockHeight,
+                onscreenWidth: onscreenWidth, onscreenHeight: onscreenHeight,
+                paletteSize: paletteSizeY, luma: true
+            )
+        }
+        if paletteSizeUV > 0 {
+            var blockWidth = (4 * bw4) >> chromaSubX
+            var blockHeight = (4 * bh4) >> chromaSubY
+            var onscreenWidth = min(4 * bw4, (miCols - miCol) * 4) >> chromaSubX
+            var onscreenHeight = min(4 * bh4, (miRows - miRow) * 4) >> chromaSubY
+            if blockWidth < 4 {
+                blockWidth += 2
+                onscreenWidth += 2
+            }
+            if blockHeight < 4 {
+                blockHeight += 2
+                onscreenHeight += 2
+            }
+            colorMapUV = readColorMap(
+                blockWidth: blockWidth, blockHeight: blockHeight,
+                onscreenWidth: onscreenWidth, onscreenHeight: onscreenHeight,
+                paletteSize: paletteSizeUV, luma: false
+            )
+        }
+    }
+
+    private func readColorMap(
+        blockWidth: Int, blockHeight: Int,
+        onscreenWidth: Int, onscreenHeight: Int,
+        paletteSize: Int, luma: Bool
+    ) -> [[Int]] {
+        var map = [[Int]](repeating: [Int](repeating: 0, count: blockWidth), count: blockHeight)
+        map[0][0] = readNonSymmetricBool(paletteSize)
+        for i in 1..<(onscreenHeight + onscreenWidth - 1) {
+            var j = min(i, onscreenWidth - 1)
+            while j >= max(0, i - onscreenHeight + 1) {
+                let (context, order) = Self.paletteColorContext(map: map, r: i - j, c: j, n: paletteSize)
+                let symbol: Int
+                if luma {
+                    symbol = decoder.readSymbol(&cdf.paletteYColor[paletteSize - 2][context])
+                } else {
+                    symbol = decoder.readSymbol(&cdf.paletteUVColor[paletteSize - 2][context])
+                }
+                map[i - j][j] = order[symbol]
+                j -= 1
+            }
+        }
+        for i in 0..<onscreenHeight {
+            for j in onscreenWidth..<blockWidth {
+                map[i][j] = map[i][onscreenWidth - 1]
+            }
+        }
+        for i in onscreenHeight..<blockHeight {
+            for j in 0..<blockWidth {
+                map[i][j] = map[onscreenHeight - 1][j]
+            }
+        }
+        return map
+    }
+
+    /// get_palette_color_context: neighbor scores rank the colors; the
+    /// score hash picks the CDF context.
+    private static let paletteColorContextTable = [-1, -1, 0, -1, -1, 4, 3, 2, 1]
+
+    private static func paletteColorContext(map: [[Int]], r: Int, c: Int, n: Int) -> (context: Int, order: [Int]) {
+        var scores = [Int](repeating: 0, count: 8)  // PALETTE_COLORS
+        var order = Array(0..<8)
+        if c > 0 {
+            scores[map[r][c - 1]] += 2
+        }
+        if r > 0, c > 0 {
+            scores[map[r - 1][c - 1]] += 1
+        }
+        if r > 0 {
+            scores[map[r - 1][c]] += 2
+        }
+        for i in 0..<3 {  // PALETTE_NUM_NEIGHBORS
+            var maxScore = scores[i]
+            var maxIdx = i
+            var j = i + 1
+            while j < n {
+                if scores[j] > maxScore {
+                    maxScore = scores[j]
+                    maxIdx = j
+                }
+                j += 1
+            }
+            if maxIdx != i {
+                let maxOrder = order[maxIdx]
+                var k = maxIdx
+                while k > i {
+                    scores[k] = scores[k - 1]
+                    order[k] = order[k - 1]
+                    k -= 1
+                }
+                scores[i] = maxScore
+                order[i] = maxOrder
+            }
+        }
+        // Palette_Color_Hash_Multipliers = [1, 2, 2]
+        let hash = scores[0] + 2 * scores[1] + 2 * scores[2]
+        return (Self.paletteColorContextTable[hash], order)
     }
 
     private func filterIntraModeInfo() {
@@ -896,6 +1177,7 @@ final class AV1TileDecoder {
         filterIntraMode = 0
         if sequence.enableFilterIntra,
            yMode == Self.dcPred,
+           paletteSizeY == 0,
            max(4 * bw4, 4 * bh4) <= 32 {
             useFilterIntra = decoder.readSymbol(&cdf.filterIntra[miSize]) == 1
             if useFilterIntra {
@@ -1055,28 +1337,33 @@ final class AV1TileDecoder {
         let stepY = AV1Tables.txHeight[txSz] >> 2
 
         if let frame {
-            let isCfl = plane > 0 && uvMode == 13  // UV_CFL_PRED
-            let mode: Int
-            if plane == 0 {
-                mode = yMode
+            let usesPalette = plane == 0 ? paletteSizeY > 0 : paletteSizeUV > 0
+            if usesPalette {
+                predictPalette(frame: frame, plane: plane, startX: startX, startY: startY, x: x, y: y, txSz: txSz)
             } else {
-                mode = isCfl ? 0 : uvMode
-            }
-            predictIntra(
-                frame: frame,
-                plane: plane,
-                x: startX,
-                y: startY,
-                haveLeft: (plane == 0 ? availL : availLChroma) || x > 0,
-                haveAbove: (plane == 0 ? availU : availUChroma) || y > 0,
-                haveAboveRight: blockDecodedFlag(plane, subBlockMiRow - 1, subBlockMiCol + stepX),
-                haveBelowLeft: blockDecodedFlag(plane, subBlockMiRow + stepY, subBlockMiCol - 1),
-                mode: mode,
-                log2W: AV1Tables.txWidthLog2[txSz],
-                log2H: AV1Tables.txHeightLog2[txSz]
-            )
-            if isCfl {
-                predictChromaFromLuma(frame: frame, plane: plane, startX: startX, startY: startY, txSz: txSz)
+                let isCfl = plane > 0 && uvMode == 13  // UV_CFL_PRED
+                let mode: Int
+                if plane == 0 {
+                    mode = yMode
+                } else {
+                    mode = isCfl ? 0 : uvMode
+                }
+                predictIntra(
+                    frame: frame,
+                    plane: plane,
+                    x: startX,
+                    y: startY,
+                    haveLeft: (plane == 0 ? availL : availLChroma) || x > 0,
+                    haveAbove: (plane == 0 ? availU : availUChroma) || y > 0,
+                    haveAboveRight: blockDecodedFlag(plane, subBlockMiRow - 1, subBlockMiCol + stepX),
+                    haveBelowLeft: blockDecodedFlag(plane, subBlockMiRow + stepY, subBlockMiCol - 1),
+                    mode: mode,
+                    log2W: AV1Tables.txWidthLog2[txSz],
+                    log2H: AV1Tables.txHeightLog2[txSz]
+                )
+                if isCfl {
+                    predictChromaFromLuma(frame: frame, plane: plane, startX: startX, startY: startY, txSz: txSz)
+                }
             }
             if plane == 0 {
                 maxLumaW = startX + stepX * 4
@@ -1114,6 +1401,24 @@ final class AV1TileDecoder {
                 for j in 0..<stepX where x4 + j < sizes[0].count {
                     frame.loopfilterTxSizes[plane][y4 + i][x4 + j] = UInt8(txSz)
                 }
+            }
+        }
+    }
+
+    /// predict_palette (7.11.4): maps color indices to palette colors.
+    private func predictPalette(frame: AV1FrameBuffer, plane: Int, startX: Int, startY: Int, x: Int, y: Int, txSz: Int) {
+        let w = AV1Tables.txWidth[txSz]
+        let h = AV1Tables.txHeight[txSz]
+        let palette: [Int]
+        switch plane {
+        case 0: palette = paletteColorsY
+        case 1: palette = paletteColorsU
+        default: palette = paletteColorsV
+        }
+        let map = plane == 0 ? colorMapY : colorMapUV
+        for i in 0..<h {
+            for j in 0..<w {
+                frame.setSample(plane, startY + i, startX + j, palette[map[y * 4 + i][x * 4 + j]])
             }
         }
     }

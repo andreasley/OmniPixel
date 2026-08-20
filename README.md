@@ -48,7 +48,7 @@ canvas[5, 5] = RGBA(red: 255, green: 0, blue: 0)
 | **QOI** | Complete | Complete |
 | **PPM/PGM** | Binary (P5/P6), including 16-bit samples | Binary PPM |
 | **HEIC** | Full pure-Swift HEVC intra decoder: 4:2:0 streams incl. wavefront parallel processing, delta-QP, SAO and deblocking, **grid (tiled) images**, default and explicit scaling lists, `colr` color conversion (BT.601/709/2020, limited/full range), `irot`/`imir` orientation, odd sizes via clean aperture | — |
-| **AVIF** | Full pure-Swift AV1 intra decoder: 8/10/12-bit, 4:2:0/4:2:2/4:4:4 and monochrome, lossless (Walsh–Hadamard) and lossy, quantizer matrices, all in-loop filters (deblocking, CDEF, loop restoration), multi-tile streams, **grid (multi-item) images**, alpha, `irot`/`imir` orientation | — |
+| **AVIF** | Full pure-Swift AV1 intra decoder: 8/10/12-bit, 4:2:0/4:2:2/4:4:4 and monochrome, lossless (Walsh–Hadamard) and lossy, palette (screen content) mode, quantizer matrices, all in-loop filters (deblocking, CDEF, loop restoration), multi-tile streams, **grid (multi-item) images**, alpha, `irot`/`imir` orientation | — |
 
 Format detection is automatic in `Image(data:)`, or available separately via `ImageFormat(detecting: data)`.
 
@@ -109,7 +109,7 @@ On non-Apple platforms the executable builds but just prints a note — the view
 Known gaps, all reported as explicit `unsupportedFeature` errors where they apply:
 
 - **HEIC**: encoding (requires an H.265 encoder); 4:4:4 chroma (produced by Apple encoders at quality 1.0 — use ≤ 0.95), HEVC tiles, PCM and dependent slices. The intra decoder was validated sample-exactly against a reference HEVC decoder; the final RGB output can differ from other decoders by small amounts because chroma upsampling filters are not standardized.
-- **AVIF**: encoding (requires an AV1 encoder); palette mode, intra block copy, super-resolution and film grain synthesis (none are produced by still-image encoders in practice). The decoder was validated sample-exactly against dav1d on every plane across qualities, speeds, bit depths and chroma formats; RGB output can differ from other viewers by small amounts because chroma upsampling filters are not standardized.
+- **AVIF**: encoding (requires an AV1 encoder); intra block copy, super-resolution and film grain synthesis (rarely produced by still-image encoders). The decoder was validated sample-exactly against dav1d on every plane across qualities, speeds, bit depths, chroma formats and screen-content (palette) coding; RGB output can differ from other viewers by small amounts because chroma upsampling filters are not standardized.
 - **Lossy and animated WebP** (VP8 coding; only lossless VP8L is supported).
 - **Animated GIF** beyond the first frame (no multi-frame API yet).
 - **JPEG**: arithmetic coding, 12-bit precision, lossless/hierarchical modes (all rare in practice).

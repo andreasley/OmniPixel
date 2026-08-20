@@ -28,6 +28,11 @@ struct AV1TileCDFs {
     var filterIntraMode: [[UInt16]]
     var paletteYMode: [[UInt16]]          // [bsizeCtx × 3 + ctx]
     var paletteUVMode: [[UInt16]]         // [ctx]
+    var paletteYSize: [[UInt16]]          // [bsizeCtx]
+    var paletteUVSize: [[UInt16]]         // [bsizeCtx]
+    /// Color-index CDFs, indexed [paletteSize - 2][ctx].
+    var paletteYColor: [[[UInt16]]]
+    var paletteUVColor: [[[UInt16]]]
     var deltaQ: [[UInt16]]
     var deltaLF: [[UInt16]]
     var deltaLFMulti: [[UInt16]]          // [frameLfIndex]
@@ -76,6 +81,20 @@ struct AV1TileCDFs {
         filterIntraMode = AV1DefaultCDFs.filterIntraMode
         paletteYMode = AV1DefaultCDFs.paletteYMode
         paletteUVMode = AV1DefaultCDFs.paletteUVMode
+        paletteYSize = AV1DefaultCDFs.paletteYSize
+        paletteUVSize = AV1DefaultCDFs.paletteUVSize
+        paletteYColor = [
+            AV1DefaultCDFs.paletteSize2YColor, AV1DefaultCDFs.paletteSize3YColor,
+            AV1DefaultCDFs.paletteSize4YColor, AV1DefaultCDFs.paletteSize5YColor,
+            AV1DefaultCDFs.paletteSize6YColor, AV1DefaultCDFs.paletteSize7YColor,
+            AV1DefaultCDFs.paletteSize8YColor,
+        ]
+        paletteUVColor = [
+            AV1DefaultCDFs.paletteSize2UVColor, AV1DefaultCDFs.paletteSize3UVColor,
+            AV1DefaultCDFs.paletteSize4UVColor, AV1DefaultCDFs.paletteSize5UVColor,
+            AV1DefaultCDFs.paletteSize6UVColor, AV1DefaultCDFs.paletteSize7UVColor,
+            AV1DefaultCDFs.paletteSize8UVColor,
+        ]
         deltaQ = AV1DefaultCDFs.deltaQ
         deltaLF = AV1DefaultCDFs.deltaLF
         deltaLFMulti = [[UInt16]](repeating: AV1DefaultCDFs.deltaLF[0], count: 4)
