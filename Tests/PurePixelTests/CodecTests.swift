@@ -946,6 +946,9 @@ import UniformTypeIdentifiers
         for i in stride(from: 3, to: pixelData.count, by: 4) {
             pixelData[i] = 255
         }
+        // noneSkipLast: the content is opaque, and declaring an alpha
+        // channel makes ImageIO's HEIF writer log a warning while
+        // stripping it anyway.
         let context = try #require(CGContext(
             data: &pixelData,
             width: 64,
@@ -953,7 +956,7 @@ import UniformTypeIdentifiers
             bitsPerComponent: 8,
             bytesPerRow: 64 * 4,
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
         ))
         let cgImage = try #require(context.makeImage())
         let output = NSMutableData()
@@ -996,6 +999,9 @@ import UniformTypeIdentifiers
                     pixelData[i + 2] = UInt8(min(255, x + y / 2))
                 }
             }
+            // noneSkipLast: the content is opaque, and declaring an alpha
+            // channel makes ImageIO's HEIF writer log a warning while
+            // stripping it anyway.
             let context = try #require(CGContext(
                 data: &pixelData,
                 width: width,
@@ -1003,7 +1009,7 @@ import UniformTypeIdentifiers
                 bitsPerComponent: 8,
                 bytesPerRow: width * 4,
                 space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
             ))
             let cgImage = try #require(context.makeImage())
             let output = NSMutableData()

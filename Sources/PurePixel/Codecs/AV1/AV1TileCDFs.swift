@@ -1,0 +1,119 @@
+/// The adaptive CDF state of one AV1 tile (spec 8.2.3/8.2.5).
+///
+/// Every tile starts from the frame defaults: still pictures never carry
+/// forward adapted state, so initialization is a straight copy of the
+/// default tables, with the coefficient tables chosen by base_q_idx
+/// (init_coeff_cdfs). Multi-dimensional spec tables are stored as flat row
+/// arrays; the decoder computes row indices from the context variables.
+struct AV1TileCDFs {
+    // MARK: Mode and partition CDFs
+
+    var intraFrameYMode: [[UInt16]]       // [aboveCtx × 5 + leftCtx]
+    var uvModeCflNotAllowed: [[UInt16]]   // [yMode]
+    var uvModeCflAllowed: [[UInt16]]      // [yMode]
+    var angleDelta: [[UInt16]]            // [directionalMode - V_PRED]
+    var intrabc: [[UInt16]]
+    var partitionW8: [[UInt16]]           // [ctx]
+    var partitionW16: [[UInt16]]
+    var partitionW32: [[UInt16]]
+    var partitionW64: [[UInt16]]
+    var partitionW128: [[UInt16]]
+    var tx8x8: [[UInt16]]                 // [ctx]
+    var tx16x16: [[UInt16]]
+    var tx32x32: [[UInt16]]
+    var tx64x64: [[UInt16]]
+    var skip: [[UInt16]]                  // [ctx]
+    var segmentID: [[UInt16]]             // [ctx]
+    var filterIntra: [[UInt16]]           // [blockSize]
+    var filterIntraMode: [[UInt16]]
+    var paletteYMode: [[UInt16]]          // [bsizeCtx × 3 + ctx]
+    var paletteUVMode: [[UInt16]]         // [ctx]
+    var deltaQ: [[UInt16]]
+    var deltaLF: [[UInt16]]
+    var deltaLFMulti: [[UInt16]]          // [frameLfIndex]
+    var intraTxTypeSet1: [[UInt16]]       // [txSizeSqr × 13 + intraDir]
+    var intraTxTypeSet2: [[UInt16]]       // [txSizeSqr × 13 + intraDir]
+    var cflSign: [[UInt16]]
+    var cflAlpha: [[UInt16]]              // [ctx]
+    var useWiener: [[UInt16]]
+    var useSgrproj: [[UInt16]]
+    var restorationType: [[UInt16]]
+
+    // MARK: Coefficient CDFs (quality-selected by init_coeff_cdfs)
+
+    var txbSkip: [[UInt16]]               // [txSzCtx × 13 + ctx]
+    var eobPt16: [[UInt16]]               // [ptype × 2 + ctx]
+    var eobPt32: [[UInt16]]
+    var eobPt64: [[UInt16]]
+    var eobPt128: [[UInt16]]
+    var eobPt256: [[UInt16]]
+    var eobPt512: [[UInt16]]              // [ptype]
+    var eobPt1024: [[UInt16]]             // [ptype]
+    var eobExtra: [[UInt16]]              // [(txSzCtx × 2 + ptype) × 9 + eobPt - 3]
+    var dcSign: [[UInt16]]                // [ptype × 3 + ctx]
+    var coeffBaseEOB: [[UInt16]]          // [(txSzCtx × 2 + ptype) × 4 + ctx]
+    var coeffBase: [[UInt16]]             // [(txSzCtx × 2 + ptype) × 42 + ctx]
+    var coeffBr: [[UInt16]]               // [(min(txSzCtx, 3) × 2 + ptype) × 21 + ctx]
+
+    init(baseQIndex: Int) {
+        intraFrameYMode = AV1DefaultCDFs.intraFrameYMode
+        uvModeCflNotAllowed = AV1DefaultCDFs.uvModeCflNotAllowed
+        uvModeCflAllowed = AV1DefaultCDFs.uvModeCflAllowed
+        angleDelta = AV1DefaultCDFs.angleDelta
+        intrabc = AV1DefaultCDFs.intrabc
+        partitionW8 = AV1DefaultCDFs.partitionW8
+        partitionW16 = AV1DefaultCDFs.partitionW16
+        partitionW32 = AV1DefaultCDFs.partitionW32
+        partitionW64 = AV1DefaultCDFs.partitionW64
+        partitionW128 = AV1DefaultCDFs.partitionW128
+        tx8x8 = AV1DefaultCDFs.tx8x8
+        tx16x16 = AV1DefaultCDFs.tx16x16
+        tx32x32 = AV1DefaultCDFs.tx32x32
+        tx64x64 = AV1DefaultCDFs.tx64x64
+        skip = AV1DefaultCDFs.skip
+        segmentID = AV1DefaultCDFs.segmentID
+        filterIntra = AV1DefaultCDFs.filterIntra
+        filterIntraMode = AV1DefaultCDFs.filterIntraMode
+        paletteYMode = AV1DefaultCDFs.paletteYMode
+        paletteUVMode = AV1DefaultCDFs.paletteUVMode
+        deltaQ = AV1DefaultCDFs.deltaQ
+        deltaLF = AV1DefaultCDFs.deltaLF
+        deltaLFMulti = [[UInt16]](repeating: AV1DefaultCDFs.deltaLF[0], count: 4)
+        intraTxTypeSet1 = AV1DefaultCDFs.intraTxTypeSet1
+        intraTxTypeSet2 = AV1DefaultCDFs.intraTxTypeSet2
+        cflSign = AV1DefaultCDFs.cflSign
+        cflAlpha = AV1DefaultCDFs.cflAlpha
+        useWiener = AV1DefaultCDFs.useWiener
+        useSgrproj = AV1DefaultCDFs.useSgrproj
+        restorationType = AV1DefaultCDFs.restorationType
+
+        // init_coeff_cdfs: quality context from base_q_idx.
+        let qContext: Int
+        if baseQIndex <= 20 {
+            qContext = 0
+        } else if baseQIndex <= 60 {
+            qContext = 1
+        } else if baseQIndex <= 120 {
+            qContext = 2
+        } else {
+            qContext = 3
+        }
+        func slice(_ table: [[UInt16]]) -> [[UInt16]] {
+            let perContext = table.count / 4
+            return Array(table[qContext * perContext..<(qContext + 1) * perContext])
+        }
+        txbSkip = slice(AV1DefaultCDFs.txbSkip)
+        eobPt16 = slice(AV1DefaultCDFs.eobPt16)
+        eobPt32 = slice(AV1DefaultCDFs.eobPt32)
+        eobPt64 = slice(AV1DefaultCDFs.eobPt64)
+        eobPt128 = slice(AV1DefaultCDFs.eobPt128)
+        eobPt256 = slice(AV1DefaultCDFs.eobPt256)
+        eobPt512 = slice(AV1DefaultCDFs.eobPt512)
+        eobPt1024 = slice(AV1DefaultCDFs.eobPt1024)
+        eobExtra = slice(AV1DefaultCDFs.eobExtra)
+        dcSign = slice(AV1DefaultCDFs.dcSign)
+        coeffBaseEOB = slice(AV1DefaultCDFs.coeffBaseEOB)
+        coeffBase = slice(AV1DefaultCDFs.coeffBase)
+        coeffBr = slice(AV1DefaultCDFs.coeffBr)
+    }
+}
