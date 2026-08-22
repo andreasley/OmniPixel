@@ -16,6 +16,10 @@ public enum ImageFormat: String, CaseIterable, Sendable {
     case qoi
     /// Netpbm binary formats (PPM/PGM).
     case netpbm
+    /// Decoded by rasterizing at the document's intrinsic size (see
+    /// `Image(svgData:width:height:)` for custom sizes); encoding is
+    /// unsupported.
+    case svg
 
     /// The conventional file extension for the format.
     public var fileExtension: String {
@@ -30,6 +34,7 @@ public enum ImageFormat: String, CaseIterable, Sendable {
         case .bmp: "bmp"
         case .qoi: "qoi"
         case .netpbm: "ppm"
+        case .svg: "svg"
         }
     }
 
@@ -53,6 +58,7 @@ public enum ImageFormat: String, CaseIterable, Sendable {
         case .bmp: BMPCodec.self
         case .qoi: QOICodec.self
         case .netpbm: NetpbmCodec.self
+        case .svg: SVGCodec.self
         }
     }
 }

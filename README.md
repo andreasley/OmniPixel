@@ -28,6 +28,12 @@ let pngData = try edited.encoded(as: .png)
 let jpegData = try edited.encoded(as: .jpeg, options: EncodingOptions(jpegQuality: 90))
 ```
 
+SVG files decode through `Image(data:)` at their intrinsic size like any other format; being vector graphics, they can also be rasterized at any size:
+
+```swift
+let icon = try Image(svgData: svgFileData, width: 512)  // height follows the aspect ratio
+```
+
 Images can also be built from scratch:
 
 ```swift
@@ -47,6 +53,7 @@ canvas[5, 5] = RGBA(red: 255, green: 0, blue: 0)
 | **BMP** | 8-bit palette, 24-bit and 32-bit uncompressed, top-down and bottom-up | 24-bit uncompressed |
 | **QOI** | Complete | Complete |
 | **PPM/PGM** | Binary (P5/P6), including 16-bit samples | Binary PPM |
+| **SVG** | Rasterized with anti-aliasing (own XML parser, path flattener and scanline renderer): all shapes and path commands, transforms, groups, `defs`/`use`, `viewBox`/`preserveAspectRatio`, both fill rules, strokes with caps and joins, linear/radial gradients, opacity, inline styles, named/hex/`rgb()`/`hsl()` colors | — |
 | **HEIC** | Full pure-Swift HEVC intra decoder: 4:2:0 streams incl. wavefront parallel processing, delta-QP, SAO and deblocking, **grid (tiled) images**, default and explicit scaling lists, `colr` color conversion (BT.601/709/2020, limited/full range), `irot`/`imir` orientation, odd sizes via clean aperture | — |
 | **AVIF** | Full pure-Swift AV1 intra decoder: 8/10/12-bit, 4:2:0/4:2:2/4:4:4 and monochrome, lossless (Walsh–Hadamard) and lossy, screen-content tools (palette mode and intra block copy), quantizer matrices, all in-loop filters (deblocking, CDEF, loop restoration), multi-tile streams, **grid (multi-item) images**, alpha, `irot`/`imir` orientation | — |
 
@@ -113,6 +120,7 @@ Known gaps, all reported as explicit `unsupportedFeature` errors where they appl
 - **Lossy and animated WebP** (VP8 coding; only lossless VP8L is supported).
 - **Animated GIF** beyond the first frame (no multi-frame API yet).
 - **JPEG**: arithmetic coding, 12-bit precision, lossless/hierarchical modes (all rare in practice).
+- **SVG**: text, embedded images, CSS stylesheets/selectors, patterns, clip paths, masks, filters, markers and dashed strokes are skipped; group opacity is approximated by multiplying it into each shape.
 - **TIFF**: tiled or planar layout, CCITT/JPEG-in-TIFF compression, EXIF _embedding_ (reading works).
 - **Pixel depth**: images are always 8 bits per channel in memory; 16-bit sources are reduced on decode.
 - **Color management**: pixel values are passed through as-is; ICC profiles are ignored.
