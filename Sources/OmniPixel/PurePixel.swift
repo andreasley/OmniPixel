@@ -1,4 +1,4 @@
-// PurePixel — a cross-platform, pure-Swift image library.
+// OmniPixel — a cross-platform, pure-Swift image library.
 //
 // Decode with `Image(data:)`, encode with `Image.encoded(as:)`, and
 // manipulate with operations like `resized(toWidth:height:method:)`

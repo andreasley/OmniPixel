@@ -1,5 +1,5 @@
 import Testing
-@testable import PurePixel
+@testable import OmniPixel
 
 #if canImport(Compression)
 import Compression
@@ -42,7 +42,7 @@ import Compression
     }
 
     @Test func compressesRepetitiveText() throws {
-        let bytes = Array(String(repeating: "PurePixel compresses repetitive data well. ", count: 200).utf8)
+        let bytes = Array(String(repeating: "OmniPixel compresses repetitive data well. ", count: 200).utf8)
         let compressed = Deflate.zlibCompress(bytes)
         #expect(try Inflate.zlibDecompress(compressed) == bytes)
         #expect(compressed.count < bytes.count / 10)

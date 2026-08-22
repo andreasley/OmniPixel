@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import PurePixel
+@testable import OmniPixel
 
 #if canImport(ImageIO)
 import CoreGraphics
@@ -12,10 +12,10 @@ import UniformTypeIdentifiers
     private func makeSampleEXIF() -> EXIFData {
         EXIFData(
             tags: [
-                EXIFTag.cameraMake: .ascii("PurePixel"),
+                EXIFTag.cameraMake: .ascii("OmniPixel"),
                 EXIFTag.cameraModel: .ascii("TestCam 3000"),
                 EXIFTag.orientation: .short([6]),
-                EXIFTag.software: .ascii("PurePixelTests"),
+                EXIFTag.software: .ascii("OmniPixelTests"),
             ],
             photoTags: [
                 EXIFTag.dateTimeOriginal: .ascii("2026:08:19 12:34:56"),
@@ -52,9 +52,9 @@ import UniformTypeIdentifiers
         #expect(decoded.height == 8)
 
         let extracted = try #require(EXIFData(data: data))
-        #expect(extracted.cameraMake == "PurePixel")
+        #expect(extracted.cameraMake == "OmniPixel")
         #expect(extracted.cameraModel == "TestCam 3000")
-        #expect(extracted.software == "PurePixelTests")
+        #expect(extracted.software == "OmniPixelTests")
         #expect(extracted.orientation == .topLeft)  // reset to upright on embed
         #expect(extracted.dateTimeOriginal == "2026:08:19 12:34:56")
         #expect(extracted.exposureTime == EXIFRational(numerator: 1, denominator: 250))
@@ -153,7 +153,7 @@ import UniformTypeIdentifiers
         let properties = try #require(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any])
 
         let tiff = try #require(properties[kCGImagePropertyTIFFDictionary as String] as? [String: Any])
-        #expect(tiff[kCGImagePropertyTIFFMake as String] as? String == "PurePixel")
+        #expect(tiff[kCGImagePropertyTIFFMake as String] as? String == "OmniPixel")
         #expect(tiff[kCGImagePropertyTIFFModel as String] as? String == "TestCam 3000")
 
         let exif = try #require(properties[kCGImagePropertyExifDictionary as String] as? [String: Any])

@@ -1,13 +1,13 @@
-# PurePixel
+# OmniPixel
 
 A cross-platform image library written entirely in Swift. It reads and writes the common image formats, converts between them, and offers basic editing — with **zero dependencies** beyond the Swift core libraries (Foundation's `Data`, plus Dispatch for decoding HEIC and AVIF tiles in parallel), so the same code runs on macOS, iOS and Linux.
 
-PurePixel is built for correctness and safety rather than raw speed: every decoder is bounds-checked and throws typed errors on malformed input, all public types are value types and `Sendable`, and the compression layers (DEFLATE, two LZW dialects, VP8L, JPEG entropy coding, HEVC CABAC, the AV1 symbol decoder) are implemented from scratch in Swift. Output is routinely validated against Apple's ImageIO and zlib in the test suite, and the HEVC and AV1 decoders were validated sample-exactly against the libde265 and dav1d reference decoders.
+OmniPixel is built for correctness and safety rather than raw speed: every decoder is bounds-checked and throws typed errors on malformed input, all public types are value types and `Sendable`, and the compression layers (DEFLATE, two LZW dialects, VP8L, JPEG entropy coding, HEVC CABAC, the AV1 symbol decoder) are implemented from scratch in Swift. Output is routinely validated against Apple's ImageIO and zlib in the test suite, and the HEVC and AV1 decoders were validated sample-exactly against the libde265 and dav1d reference decoders.
 
 ## Quick start
 
 ```swift
-import PurePixel
+import OmniPixel
 
 // Decode any supported format; the format is detected from the bytes.
 let image = try Image(data: fileData)
@@ -56,7 +56,7 @@ PNG, TIFF, WebP and QOI round-trip **losslessly**, including the alpha channel. 
 
 ## EXIF metadata
 
-PurePixel reads EXIF from JPEG, TIFF, PNG and WebP files, and writes it into JPEG, PNG and WebP:
+OmniPixel reads EXIF from JPEG, TIFF, PNG and WebP files, and writes it into JPEG, PNG and WebP:
 
 ```swift
 if let exif = EXIFData(data: fileData) {
@@ -89,17 +89,17 @@ Everything that can fail throws `ImageError`:
 
 - `.unknownFormat` — the data matches no known format
 - `.invalidData(reason:)` — recognized format, malformed content
-- `.unsupportedFeature(reason:)` — valid file using a feature PurePixel doesn't implement (the reason string says exactly which)
+- `.unsupportedFeature(reason:)` — valid file using a feature OmniPixel doesn't implement (the reason string says exactly which)
 - `.invalidDimensions`, `.regionOutOfBounds` — bad operation arguments
 
 Decoders never crash on malformed input: all reads are bounds-checked, sizes are sanity-capped, and arithmetic is overflow-checked.
 
 ## Demo app
 
-The package includes **PurePixelViewer**, a small SwiftUI image viewer for macOS that exercises the library end to end: it opens any supported format (file picker or drag & drop), decodes it with PurePixel's own codecs, shows the detected format and EXIF metadata, offers rotation, mirroring, scaling and cropping, and re-encodes to any writable format (with a JPEG quality slider) for export. The platform frameworks are only used to draw the finished pixels.
+The package includes **OmniPixelViewer**, a small SwiftUI image viewer for macOS that exercises the library end to end: it opens any supported format (file picker or drag & drop), decodes it with OmniPixel's own codecs, shows the detected format and EXIF metadata, offers rotation, mirroring, scaling and cropping, and re-encodes to any writable format (with a JPEG quality slider) for export. The platform frameworks are only used to draw the finished pixels.
 
 ```sh
-swift run PurePixelViewer
+swift run OmniPixelViewer
 ```
 
 On non-Apple platforms the executable builds but just prints a note — the viewer's interface is SwiftUI.

@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import PurePixel
+@testable import OmniPixel
 
 @Suite("AVIF")
 struct AVIFTests {
@@ -293,7 +293,7 @@ struct AVIFTests {
             }
         }
         let directory = FileManager.default.temporaryDirectory
-        let pngURL = directory.appendingPathComponent("purepixel-avif-source.png")
+        let pngURL = directory.appendingPathComponent("OmniPixel-avif-source.png")
         try source.encoded(as: .png).write(to: pngURL)
 
         for (arguments, expectedDepth, expectedMono) in [
@@ -304,7 +304,7 @@ struct AVIFTests {
             // self-guided parameter syntax.
             (["-s", "0", "-y", "420"], 8, false),
         ] {
-            let outputURL = directory.appendingPathComponent("purepixel-avif-out.avif")
+            let outputURL = directory.appendingPathComponent("OmniPixel-avif-out.avif")
             try? FileManager.default.removeItem(at: outputURL)
             let process = Process()
             process.executableURL = URL(fileURLWithPath: encoder)
@@ -347,9 +347,9 @@ struct AVIFTests {
                 )
             }
         }
-        let alphaPNG = directory.appendingPathComponent("purepixel-avif-alpha.png")
+        let alphaPNG = directory.appendingPathComponent("OmniPixel-avif-alpha.png")
         try alphaSource.encoded(as: .png).write(to: alphaPNG)
-        let alphaURL = directory.appendingPathComponent("purepixel-avif-alpha.avif")
+        let alphaURL = directory.appendingPathComponent("OmniPixel-avif-alpha.avif")
         try? FileManager.default.removeItem(at: alphaURL)
         let alphaProcess = Process()
         alphaProcess.executableURL = URL(fileURLWithPath: encoder)
@@ -391,9 +391,9 @@ struct AVIFTests {
             let y = (speckle >> 8) % 48
             screenSource[x, y] = screenColors[(x + y) % 4]
         }
-        let screenPNG = directory.appendingPathComponent("purepixel-avif-screen.png")
+        let screenPNG = directory.appendingPathComponent("OmniPixel-avif-screen.png")
         try screenSource.encoded(as: .png).write(to: screenPNG)
-        let screenURL = directory.appendingPathComponent("purepixel-avif-screen.avif")
+        let screenURL = directory.appendingPathComponent("OmniPixel-avif-screen.avif")
         try? FileManager.default.removeItem(at: screenURL)
         let screenProcess = Process()
         screenProcess.executableURL = URL(fileURLWithPath: encoder)
@@ -454,9 +454,9 @@ struct AVIFTests {
             }
             gy += 24
         }
-        let stampPNG = directory.appendingPathComponent("purepixel-avif-ibc.png")
+        let stampPNG = directory.appendingPathComponent("OmniPixel-avif-ibc.png")
         try stampSource.encoded(as: .png).write(to: stampPNG)
-        let ibcURL = directory.appendingPathComponent("purepixel-avif-ibc.avif")
+        let ibcURL = directory.appendingPathComponent("OmniPixel-avif-ibc.avif")
         try? FileManager.default.removeItem(at: ibcURL)
         let ibcProcess = Process()
         ibcProcess.executableURL = URL(fileURLWithPath: encoder)
@@ -503,9 +503,9 @@ struct AVIFTests {
                 gridSource[x, y] = RGBA(red: UInt8(x * 2), green: UInt8(255 - x * 2), blue: UInt8(y * 2))
             }
         }
-        let gridPNG = directory.appendingPathComponent("purepixel-avif-grid.png")
+        let gridPNG = directory.appendingPathComponent("OmniPixel-avif-grid.png")
         try gridSource.encoded(as: .png).write(to: gridPNG)
-        let gridURL = directory.appendingPathComponent("purepixel-avif-grid.avif")
+        let gridURL = directory.appendingPathComponent("OmniPixel-avif-grid.avif")
         try? FileManager.default.removeItem(at: gridURL)
         let gridProcess = Process()
         gridProcess.executableURL = URL(fileURLWithPath: encoder)
@@ -536,7 +536,7 @@ struct AVIFTests {
         #expect(gridPSNR > 32, "grid PSNR \(gridPSNR) too low")
 
         // A fresh lossless encode must decode back to the source exactly.
-        let losslessURL = directory.appendingPathComponent("purepixel-avif-lossless.avif")
+        let losslessURL = directory.appendingPathComponent("OmniPixel-avif-lossless.avif")
         try? FileManager.default.removeItem(at: losslessURL)
         let losslessProcess = Process()
         losslessProcess.executableURL = URL(fileURLWithPath: encoder)
@@ -560,7 +560,7 @@ struct AVIFTests {
         // A lossy encode without in-loop filters must decode to an image
         // close to the source (reconstruction is oracle-validated
         // sample-exactly against avifdec during bring-up).
-        let lossyURL = directory.appendingPathComponent("purepixel-avif-nofilter.avif")
+        let lossyURL = directory.appendingPathComponent("OmniPixel-avif-nofilter.avif")
         try? FileManager.default.removeItem(at: lossyURL)
         let lossyProcess = Process()
         lossyProcess.executableURL = URL(fileURLWithPath: encoder)
@@ -593,7 +593,7 @@ struct AVIFTests {
     }
 
     private static func bundledEncoderPath() -> String? {
-        // Tests/PurePixelTests/AVIFTests.swift → repository root → libavif.
+        // Tests/OmniPixelTests/AVIFTests.swift → repository root → libavif.
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()

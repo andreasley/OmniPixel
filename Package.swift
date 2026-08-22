@@ -4,7 +4,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "PurePixel",
+    name: "OmniPixel",
     platforms: [
         // The library itself only needs Foundation; the viewer's SwiftUI
         // interface sets the macOS floor. Linux is unaffected.
@@ -14,33 +14,33 @@ let package = Package(
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
-            name: "PurePixel",
-            targets: ["PurePixel"]
+            name: "OmniPixel",
+            targets: ["OmniPixel"]
         ),
         .executable(
-            name: "PurePixelViewer",
-            targets: ["PurePixelViewer"]
+            name: "OmniPixelViewer",
+            targets: ["OmniPixelViewer"]
         ),
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
-            name: "PurePixel",
+            name: "OmniPixel",
             swiftSettings: [
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],
         ),
         .executableTarget(
-            name: "PurePixelViewer",
-            dependencies: ["PurePixel"],
+            name: "OmniPixelViewer",
+            dependencies: ["OmniPixel"],
             swiftSettings: [
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],
         ),
         .testTarget(
-            name: "PurePixelTests",
-            dependencies: ["PurePixel"],
+            name: "OmniPixelTests",
+            dependencies: ["OmniPixel"],
             swiftSettings: [
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],

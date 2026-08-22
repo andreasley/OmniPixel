@@ -1,6 +1,6 @@
 import Foundation
 
-/// A file format PurePixel can read and write.
+/// A file format OmniPixel can read and write.
 public enum ImageFormat: String, CaseIterable, Sendable {
     case png
     case jpeg
@@ -65,7 +65,7 @@ public struct EncodingOptions: Sendable {
     public var jpegQuality: Int
 
     /// EXIF metadata to embed. Honored when encoding JPEG, PNG and WebP;
-    /// the orientation tag is reset to upright because PurePixel always
+    /// the orientation tag is reset to upright because OmniPixel always
     /// encodes pixels in display order.
     public var exif: EXIFData?
 

@@ -1,4 +1,4 @@
-/// Errors thrown by PurePixel when decoding, encoding or manipulating images.
+/// Errors thrown by OmniPixel when decoding, encoding or manipulating images.
 public enum ImageError: Error, Equatable, Sendable {
     /// The data doesn't match any known image format.
     case unknownFormat

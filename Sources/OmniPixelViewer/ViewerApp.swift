@@ -1,14 +1,14 @@
 #if canImport(SwiftUI) && os(macOS)
 import SwiftUI
 
-/// A small image viewer demonstrating PurePixel: every image is decoded,
+/// A small image viewer demonstrating OmniPixel: every image is decoded,
 /// edited and re-encoded by the library's pure-Swift codecs — the platform
 /// frameworks only put the finished pixels on screen.
 @main
 struct ViewerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     var body: some Scene {
-        WindowGroup("PurePixel Viewer") {
+        WindowGroup("OmniPixel Viewer") {
             ContentView()
         }
     }
@@ -26,8 +26,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct ViewerApp {
     static func main() {
-        print("The PurePixel viewer is a SwiftUI application and runs on macOS.")
-        print("The PurePixel library itself works on any platform with Foundation.")
+        print("The OmniPixel viewer is a SwiftUI application and runs on macOS.")
+        print("The OmniPixel library itself works on any platform with Foundation.")
     }
 }
 #endif

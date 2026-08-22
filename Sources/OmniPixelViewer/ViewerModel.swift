@@ -1,12 +1,12 @@
 #if canImport(SwiftUI) && os(macOS)
 import CoreGraphics
 import Foundation
-import PurePixel
+import OmniPixel
 
-/// The viewer's state: the currently loaded image, everything PurePixel
+/// The viewer's state: the currently loaded image, everything OmniPixel
 /// knows about its source file, and the editing operations offered by the
 /// interface. All decoding, metadata parsing, editing and re-encoding is
-/// done by PurePixel; the platform only displays and moves bytes.
+/// done by OmniPixel; the platform only displays and moves bytes.
 @MainActor
 final class ViewerModel: ObservableObject {
     @Published private(set) var image: PixelImage?
@@ -44,7 +44,7 @@ final class ViewerModel: ObservableObject {
         errorMessage = nil
         Task {
             do {
-                // Decode off the main actor; PurePixel types are Sendable.
+                // Decode off the main actor; OmniPixel types are Sendable.
                 let decoded = try await Task.detached(priority: .userInitiated) {
                     try PixelImage(data: data)
                 }.value
@@ -83,7 +83,7 @@ final class ViewerModel: ObservableObject {
         isLoading = false
     }
 
-    // MARK: Editing (PurePixel operations)
+    // MARK: Editing (OmniPixel operations)
 
     func transform(_ operation: (PixelImage) throws -> PixelImage) {
         guard let current = image else { return }
@@ -129,7 +129,7 @@ final class ViewerModel: ObservableObject {
         displayImage = original.makeCGImage()
     }
 
-    // MARK: Export (PurePixel encoders)
+    // MARK: Export (OmniPixel encoders)
 
     func exportData(as format: ImageFormat, jpegQuality: Int) throws -> Data {
         guard let image else {

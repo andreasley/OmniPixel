@@ -1,5 +1,5 @@
 #if canImport(SwiftUI) && os(macOS)
-import PurePixel
+import OmniPixel
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -40,7 +40,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showExportSheet) { exportSheet }
         .alert(
-            "PurePixel",
+            "OmniPixel",
             isPresented: Binding(
                 get: { model.errorMessage != nil },
                 set: { if !$0 { model.errorMessage = nil } }
@@ -55,7 +55,7 @@ struct ContentView: View {
             model.open(url: url)
             return true
         }
-        .navigationTitle(model.fileName ?? "PurePixel Viewer")
+        .navigationTitle(model.fileName ?? "OmniPixel Viewer")
     }
 
     // MARK: Views
@@ -63,7 +63,7 @@ struct ContentView: View {
     private var emptyView: some View {
         VStack(spacing: 12) {
             if model.isLoading {
-                ProgressView("Decoding with PurePixel…")
+                ProgressView("Decoding with OmniPixel…")
             } else {
                 SwiftUI.Image(systemName: "photo.on.rectangle.angled")
                     .font(.system(size: 56))
@@ -216,7 +216,7 @@ struct ContentView: View {
                 } label: {
                     Label("Export", systemImage: "square.and.arrow.up")
                 }
-                .help("Re-encode with PurePixel and save")
+                .help("Re-encode with OmniPixel and save")
             }
         }
     }
@@ -229,7 +229,7 @@ struct ContentView: View {
 
     private var exportSheet: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Export with PurePixel")
+            Text("Export with OmniPixel")
                 .font(.headline)
             Picker("Format", selection: $exportFormat) {
                 ForEach(Self.exportFormats, id: \.self) { format in
@@ -293,7 +293,7 @@ struct ContentView: View {
     }
 }
 
-/// A write-only document wrapping PurePixel-encoded bytes for `fileExporter`.
+/// A write-only document wrapping OmniPixel-encoded bytes for `fileExporter`.
 struct ExportDocument: FileDocument {
     static let readableContentTypes: [UTType] = []
     static let writableContentTypes: [UTType] = [

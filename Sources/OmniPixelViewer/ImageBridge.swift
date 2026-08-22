@@ -1,14 +1,14 @@
 #if canImport(SwiftUI) && os(macOS)
 import CoreGraphics
 import Foundation
-import PurePixel
+import OmniPixel
 
-/// PurePixel's image type; aliased because SwiftUI also has an `Image`.
-typealias PixelImage = PurePixel.Image
+/// OmniPixel's image type; aliased because SwiftUI also has an `Image`.
+typealias PixelImage = OmniPixel.Image
 
 extension PixelImage {
     /// Bridges the decoded RGBA buffer to Core Graphics for display.
-    /// PurePixel does all decoding itself — this is presentation only.
+    /// OmniPixel does all decoding itself — this is presentation only.
     func makeCGImage() -> CGImage? {
         var bytes = [UInt8](repeating: 0, count: width * height * 4)
         for (index, pixel) in pixels.enumerated() {

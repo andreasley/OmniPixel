@@ -1,5 +1,5 @@
 import Testing
-@testable import PurePixel
+@testable import OmniPixel
 
 @Suite struct ImageTests {
     @Test func fillInitAndSubscript() {

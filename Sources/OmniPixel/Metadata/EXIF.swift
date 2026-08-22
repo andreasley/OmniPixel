@@ -321,7 +321,7 @@ public struct EXIFData: Hashable, Sendable {
 
     /// Serializes the metadata as a little-endian TIFF block — the payload
     /// format shared by JPEG APP1, PNG eXIf and WebP EXIF. The orientation
-    /// tag is reset to upright because PurePixel always encodes pixels in
+    /// tag is reset to upright because OmniPixel always encodes pixels in
     /// display order; keeping the original value would rotate them twice.
     func serializedPayload() -> [UInt8] {
         var mainTags = tags

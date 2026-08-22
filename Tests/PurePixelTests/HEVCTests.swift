@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import PurePixel
+@testable import OmniPixel
 
 #if canImport(ImageIO)
 import CoreGraphics
