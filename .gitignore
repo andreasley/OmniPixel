@@ -9,3 +9,5 @@ DerivedData/
 .claude
 .DS_Store
 .swiftpm
+libavif
+/Samples
