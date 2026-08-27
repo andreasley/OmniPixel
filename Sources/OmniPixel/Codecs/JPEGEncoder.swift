@@ -3,6 +3,13 @@ import Foundation
 // The encoding half of JPEGCodec: baseline 4:4:4 YCbCr with the standard
 // Annex K quantization and Huffman tables. Quality comes from
 // EncodingOptions.jpegQuality (1...100, default 85).
+//
+// The scan is produced in two passes. The first colour-converts, transforms
+// and quantizes an MCU row into 16-bit coefficients and runs concurrently
+// across rows; the second Huffman-codes those coefficients and is inherently
+// serial, because the DC predictor chain and the bit alignment thread through
+// every block. The passes alternate over chunks of MCU rows so the
+// coefficient scratch stays a few megabytes regardless of image size.
 extension JPEGCodec {
 
     // MARK: Standard tables (ITU T.81 Annex K)
@@ -85,60 +92,8 @@ extension JPEGCodec {
         let luminanceQuantization = scaledTable(baseLuminanceQuantization, quality: quality)
         let chrominanceQuantization = scaledTable(baseChrominanceQuantization, quality: quality)
 
-        // Convert to level-shifted YCbCr planes padded to multiples of eight
-        // by edge replication (alpha is discarded).
-        let paddedWidth = (image.width + 7) / 8 * 8
-        let paddedHeight = (image.height + 7) / 8 * 8
-        var planes = [[Double]](
-            repeating: [Double](repeating: 0, count: paddedWidth * paddedHeight),
-            count: 3
-        )
-        for y in 0..<paddedHeight {
-            for x in 0..<paddedWidth {
-                let pixel = image.pixels[min(y, image.height - 1) * image.width + min(x, image.width - 1)]
-                let red = Double(pixel.red)
-                let green = Double(pixel.green)
-                let blue = Double(pixel.blue)
-                let i = y * paddedWidth + x
-                planes[0][i] = 0.299 * red + 0.587 * green + 0.114 * blue - 128
-                planes[1][i] = -0.168736 * red - 0.331264 * green + 0.5 * blue
-                planes[2][i] = 0.5 * red - 0.418688 * green - 0.081312 * blue
-            }
-        }
-
-        let dcEncoders = [
-            HuffmanEncoder(counts: dcLuminanceCounts, symbols: dcLuminanceSymbols),
-            HuffmanEncoder(counts: dcChrominanceCounts, symbols: dcChrominanceSymbols),
-        ]
-        let acEncoders = [
-            HuffmanEncoder(counts: acLuminanceCounts, symbols: acLuminanceSymbols),
-            HuffmanEncoder(counts: acChrominanceCounts, symbols: acChrominanceSymbols),
-        ]
-        let quantizations = [luminanceQuantization, chrominanceQuantization]
-
-        var bitWriter = JPEGBitWriter()
-        var predictors = [0, 0, 0]
-        for blockY in stride(from: 0, to: paddedHeight, by: 8) {
-            for blockX in stride(from: 0, to: paddedWidth, by: 8) {
-                for componentIndex in 0..<3 {
-                    let tableIndex = componentIndex == 0 ? 0 : 1
-                    encodeBlock(
-                        plane: planes[componentIndex],
-                        planeWidth: paddedWidth,
-                        originX: blockX,
-                        originY: blockY,
-                        quantization: quantizations[tableIndex],
-                        dcEncoder: dcEncoders[tableIndex],
-                        acEncoder: acEncoders[tableIndex],
-                        predictor: &predictors[componentIndex],
-                        to: &bitWriter
-                    )
-                }
-            }
-        }
-        let entropyData = bitWriter.finish()
-
-        // Assemble the file.
+        // Assemble the header first, so a rejected EXIF block fails before the
+        // scan is encoded.
         var writer = ByteWriter()
         writer.writeBytes([0xFF, 0xD8])  // SOI
 
@@ -196,7 +151,11 @@ extension JPEGCodec {
         writer.writeBytes([3, 0x11])
         writer.writeBytes([0, 63, 0])  // full spectral range, no approximation
 
-        writer.writeBytes(entropyData)
+        writer.writeBytes(encodeScan(
+            image,
+            luminanceQuantization: luminanceQuantization,
+            chrominanceQuantization: chrominanceQuantization
+        ))
         writer.writeBytes([0xFF, 0xD9])  // EOI
         return writer.data
     }
@@ -214,133 +173,524 @@ extension JPEGCodec {
         writer.writeBytes(symbols)
     }
 
-    private static func encodeBlock(
-        plane: [Double],
-        planeWidth: Int,
+    // MARK: Scan encoding
+
+    /// Where each of the four code tables starts in the flattened
+    /// Huffman entry array.
+    private static let dcLuminanceTable = 0
+    private static let acLuminanceTable = 256
+    private static let dcChrominanceTable = 512
+    private static let acChrominanceTable = 768
+
+    /// One position of the zigzag scan: which coefficient of the naturally
+    /// ordered block it reads, and the reciprocal of the divisor to apply.
+    /// Pairing the two keeps the quantization loop down to a single table.
+    private struct QuantizationStep {
+        var naturalIndex: Int
+        var reciprocal: Double
+    }
+
+    /// Arai–Agui–Nakajima scale factors: the fast DCT below leaves its output
+    /// multiplied by 8·aan[row]·aan[column], which the divisors fold back out.
+    private static let aanScaleFactor: [Double] = (0..<8).map {
+        $0 == 0 ? 1 : cos(Double($0) * Double.pi / 16) * Double(2).squareRoot()
+    }
+
+    /// Encodes the entropy-coded segment: every MCU in raster order, each
+    /// carrying one Y, Cb and Cr block (4:4:4, so one block per component).
+    private static func encodeScan(
+        _ image: Image,
+        luminanceQuantization: [Int],
+        chrominanceQuantization: [Int]
+    ) -> [UInt8] {
+        var quantizationSteps = [QuantizationStep](
+            repeating: QuantizationStep(naturalIndex: 0, reciprocal: 0),
+            count: 128
+        )
+        for k in 0..<64 {
+            let natural = zigzag[k]
+            let scale = 8 * aanScaleFactor[natural / 8] * aanScaleFactor[natural % 8]
+            quantizationSteps[k] = QuantizationStep(
+                naturalIndex: natural,
+                reciprocal: 1 / (Double(luminanceQuantization[natural]) * scale)
+            )
+            quantizationSteps[64 + k] = QuantizationStep(
+                naturalIndex: natural,
+                reciprocal: 1 / (Double(chrominanceQuantization[natural]) * scale)
+            )
+        }
+
+        // The four canonical code tables flattened into one array of
+        // (length << 16 | code) entries, so the hot loop needs a single base
+        // pointer plus a table offset.
+        var huffmanEntries = [UInt32](repeating: 0, count: 4 * 256)
+        fillHuffmanCodes(
+            into: &huffmanEntries, at: dcLuminanceTable,
+            counts: dcLuminanceCounts, symbols: dcLuminanceSymbols
+        )
+        fillHuffmanCodes(
+            into: &huffmanEntries, at: acLuminanceTable,
+            counts: acLuminanceCounts, symbols: acLuminanceSymbols
+        )
+        fillHuffmanCodes(
+            into: &huffmanEntries, at: dcChrominanceTable,
+            counts: dcChrominanceCounts, symbols: dcChrominanceSymbols
+        )
+        fillHuffmanCodes(
+            into: &huffmanEntries, at: acChrominanceTable,
+            counts: acChrominanceCounts, symbols: acChrominanceSymbols
+        )
+
+        let width = image.width
+        let height = image.height
+        let mcuColumns = (width + 7) / 8
+        let mcuRows = (height + 7) / 8
+        let blocksPerRow = mcuColumns * 3
+        let coefficientsPerRow = blocksPerRow * 64
+
+        // Transform a band of MCU rows at a time, sized so the coefficient
+        // scratch stays around two megabytes.
+        let rowsPerChunk = max(1, min(mcuRows, 2_000_000 / (coefficientsPerRow * MemoryLayout<Int16>.stride)))
+        // Below roughly a thousand blocks the dispatch overhead outweighs the
+        // work, so small images stay on one thread.
+        let runsConcurrently = mcuRows * mcuColumns >= 1024
+        var scratch = [Int16](repeating: 0, count: rowsPerChunk * coefficientsPerRow)
+        var occupancy = [UInt64](repeating: 0, count: rowsPerChunk * blocksPerRow)
+
+        var bitWriter = JPEGBitWriter(capacityHint: mcuRows * mcuColumns * 48)
+        var predictors = (luma: 0, blueChroma: 0, redChroma: 0)
+
+        image.pixels.withUnsafeBufferPointer { pixelBuffer in
+            quantizationSteps.withUnsafeBufferPointer { stepBuffer in
+                huffmanEntries.withUnsafeBufferPointer { huffmanBuffer in
+                    let pixels = pixelBuffer.baseAddress!
+                    let steps = stepBuffer.baseAddress!
+                    let huffman = huffmanBuffer.baseAddress!
+
+                    var firstRow = 0
+                    while firstRow < mcuRows {
+                        let chunkRows = min(rowsPerChunk, mcuRows - firstRow)
+                        let bandStart = firstRow
+
+                        scratch.withUnsafeMutableBufferPointer { chunk in
+                            occupancy.withUnsafeMutableBufferPointer { masks in
+                                nonisolated(unsafe) let output = chunk.baseAddress!
+                                nonisolated(unsafe) let maskOutput = masks.baseAddress!
+                                nonisolated(unsafe) let source = pixels
+                                nonisolated(unsafe) let divisors = steps
+                                let transformRow: @Sendable (Int) -> Void = { index in
+                                    transformMCURow(
+                                        mcuRow: bandStart + index,
+                                        mcuColumns: mcuColumns,
+                                        pixels: source,
+                                        width: width,
+                                        height: height,
+                                        steps: divisors,
+                                        into: output + index * coefficientsPerRow,
+                                        occupancy: maskOutput + index * blocksPerRow
+                                    )
+                                }
+                                if runsConcurrently {
+                                    DispatchQueue.concurrentPerform(iterations: chunkRows, execute: transformRow)
+                                } else {
+                                    for index in 0..<chunkRows {
+                                        transformRow(index)
+                                    }
+                                }
+                            }
+                        }
+
+                        scratch.withUnsafeBufferPointer { chunk in
+                            occupancy.withUnsafeBufferPointer { masks in
+                                encodeMCUs(
+                                    chunk.baseAddress!,
+                                    occupancy: masks.baseAddress!,
+                                    count: chunkRows * mcuColumns,
+                                    huffman: huffman,
+                                    predictors: &predictors,
+                                    to: &bitWriter
+                                )
+                            }
+                        }
+
+                        firstRow += chunkRows
+                    }
+                }
+            }
+        }
+
+        return bitWriter.finish()
+    }
+
+    /// Fills 256 canonical `(length << 16 | code)` entries from a standard
+    /// (counts, symbols) table definition; unused symbols stay zero.
+    private static func fillHuffmanCodes(
+        into entries: inout [UInt32],
+        at base: Int,
+        counts: [Int],
+        symbols: [UInt8]
+    ) {
+        precondition(counts.reduce(0, +) == symbols.count, "Huffman counts must match symbol count")
+        var code: UInt32 = 0
+        var symbolIndex = 0
+        for length in 1...16 {
+            for _ in 0..<counts[length - 1] {
+                entries[base + Int(symbols[symbolIndex])] = UInt32(length) << 16 | code
+                code += 1
+                symbolIndex += 1
+            }
+            code <<= 1
+        }
+    }
+
+    // MARK: Transform pass
+
+    /// Colour-converts, transforms and quantizes one MCU row, writing three
+    /// zigzag-ordered 64-coefficient blocks (Y, Cb, Cr) per MCU, plus a
+    /// bitmask per block marking which coefficients came out non-zero. The
+    /// mask costs nothing here — the values are already in hand — and saves
+    /// the serial entropy pass from scanning for them.
+    private static func transformMCURow(
+        mcuRow: Int,
+        mcuColumns: Int,
+        pixels: UnsafePointer<RGBA>,
+        width: Int,
+        height: Int,
+        steps: UnsafePointer<QuantizationStep>,
+        into output: UnsafeMutablePointer<Int16>,
+        occupancy: UnsafeMutablePointer<UInt64>
+    ) {
+        let originY = mcuRow * 8
+        withUnsafeTemporaryAllocation(of: Double.self, capacity: 3 * 64) { scratch in
+            let block = scratch.baseAddress!
+            for mcu in 0..<mcuColumns {
+                loadYCbCrBlock(
+                    pixels: pixels,
+                    width: width,
+                    height: height,
+                    originX: mcu * 8,
+                    originY: originY,
+                    into: block
+                )
+                for component in 0..<3 {
+                    let coefficients = block + component * 64
+                    forwardDCT(coefficients)
+
+                    let step = steps + (component == 0 ? 0 : 64)
+                    let destination = output + (mcu * 3 + component) * 64
+                    var nonZero: UInt64 = 0
+                    for k in 0..<64 {
+                        let value = (coefficients[step[k].naturalIndex] * step[k].reciprocal).rounded()
+                        // The clamp keeps AC magnitudes within the 10 bits the
+                        // standard Huffman tables can express (only reachable
+                        // near quality 100).
+                        let quantized = Int16(min(1023, max(-1023, value)))
+                        destination[k] = quantized
+                        nonZero |= (quantized == 0 ? 0 : 1) << UInt64(k)
+                    }
+                    occupancy[mcu * 3 + component] = nonZero
+                }
+            }
+        }
+    }
+
+    /// Reads an 8×8 pixel block and writes level-shifted Y, Cb and Cr samples
+    /// into three consecutive 64-sample blocks. Blocks hanging off the right
+    /// or bottom edge replicate the last real column and row.
+    private static func loadYCbCrBlock(
+        pixels: UnsafePointer<RGBA>,
+        width: Int,
+        height: Int,
         originX: Int,
         originY: Int,
-        quantization: [Int],
-        dcEncoder: HuffmanEncoder,
-        acEncoder: HuffmanEncoder,
+        into block: UnsafeMutablePointer<Double>
+    ) {
+        let luma = block
+        let blueChroma = block + 64
+        let redChroma = block + 128
+        let validColumns = min(8, width - originX)
+        for row in 0..<8 {
+            let source = pixels + min(originY + row, height - 1) * width + originX
+            let destination = row * 8
+            for column in 0..<validColumns {
+                let pixel = source[column]
+                let red = Double(pixel.red)
+                let green = Double(pixel.green)
+                let blue = Double(pixel.blue)
+                luma[destination + column] = 0.299 * red + 0.587 * green + 0.114 * blue - 128
+                blueChroma[destination + column] = -0.168736 * red - 0.331264 * green + 0.5 * blue
+                redChroma[destination + column] = 0.5 * red - 0.418688 * green - 0.081312 * blue
+            }
+            for column in validColumns..<8 {
+                luma[destination + column] = luma[destination + validColumns - 1]
+                blueChroma[destination + column] = blueChroma[destination + validColumns - 1]
+                redChroma[destination + column] = redChroma[destination + validColumns - 1]
+            }
+        }
+    }
+
+    // Rotation constants of the AA&N factorization: cos(π/4), sin(π/8),
+    // cos(π/8) − sin(π/8) and cos(π/8) + sin(π/8).
+    private static let cosPiOver4 = 0.707106781186547524
+    private static let sinPiOver8 = 0.382683432365089772
+    private static let cosMinusSinPiOver8 = 0.541196100146196984
+    private static let cosPlusSinPiOver8 = 1.306562964876376528
+
+    /// In-place Arai–Agui–Nakajima scaled forward DCT of an 8×8 block: eight
+    /// row butterflies, then eight column butterflies. Trading the textbook
+    /// 4096 multiplies for 80 is the single biggest win in the encoder; the
+    /// leftover per-coefficient scaling rides along in the quantization
+    /// reciprocals instead of being undone here.
+    private static func forwardDCT(_ block: UnsafeMutablePointer<Double>) {
+        for row in 0..<8 {
+            butterfly(block, base: row * 8, step: 1)
+        }
+        for column in 0..<8 {
+            butterfly(block, base: column, step: 8)
+        }
+    }
+
+    /// One 1-D pass of the AA&N factorization over eight samples starting at
+    /// `base` and spaced `step` apart.
+    @inline(__always)
+    private static func butterfly(_ block: UnsafeMutablePointer<Double>, base: Int, step: Int) {
+        let s0 = block[base]
+        let s1 = block[base + step]
+        let s2 = block[base + 2 * step]
+        let s3 = block[base + 3 * step]
+        let s4 = block[base + 4 * step]
+        let s5 = block[base + 5 * step]
+        let s6 = block[base + 6 * step]
+        let s7 = block[base + 7 * step]
+
+        let tmp0 = s0 + s7, tmp7 = s0 - s7
+        let tmp1 = s1 + s6, tmp6 = s1 - s6
+        let tmp2 = s2 + s5, tmp5 = s2 - s5
+        let tmp3 = s3 + s4, tmp4 = s3 - s4
+
+        // Even part: a two-level butterfly plus one rotation.
+        let even0 = tmp0 + tmp3
+        let even3 = tmp0 - tmp3
+        let even1 = tmp1 + tmp2
+        let even2 = tmp1 - tmp2
+        let rotated = (even2 + even3) * cosPiOver4
+        block[base] = even0 + even1
+        block[base + 4 * step] = even0 - even1
+        block[base + 2 * step] = even3 + rotated
+        block[base + 6 * step] = even3 - rotated
+
+        // Odd part, arranged as in Pennebaker & Mitchell figure 4-8 with the
+        // rotator folded to avoid extra negations.
+        let odd0 = tmp4 + tmp5
+        let odd1 = tmp5 + tmp6
+        let odd2 = tmp6 + tmp7
+        let shared = (odd0 - odd2) * sinPiOver8
+        let lower = cosMinusSinPiOver8 * odd0 + shared
+        let upper = cosPlusSinPiOver8 * odd2 + shared
+        let middle = odd1 * cosPiOver4
+        let sum = tmp7 + middle
+        let difference = tmp7 - middle
+        block[base + 5 * step] = difference + lower
+        block[base + 3 * step] = difference - lower
+        block[base + step] = sum + upper
+        block[base + 7 * step] = sum - upper
+    }
+
+    // MARK: Entropy pass
+
+    /// Huffman-codes a run of MCUs, each holding one Y, Cb and Cr block.
+    ///
+    /// The bit writer and the DC predictors are copied into locals for the
+    /// duration. Both are touched several times per coefficient, and left
+    /// behind an `inout` they would have to be reloaded after every byte
+    /// stored through the output buffer, which the optimizer has to assume
+    /// might alias them.
+    private static func encodeMCUs(
+        _ coefficients: UnsafePointer<Int16>,
+        occupancy: UnsafePointer<UInt64>,
+        count: Int,
+        huffman: UnsafePointer<UInt32>,
+        predictors: inout (luma: Int, blueChroma: Int, redChroma: Int),
+        to writer: inout JPEGBitWriter
+    ) {
+        var bits = writer
+        var (luma, blueChroma, redChroma) = predictors
+        var block = coefficients
+        var masks = occupancy
+        for _ in 0..<count {
+            encodeBlock(
+                block, nonZero: masks[0],
+                dcTable: huffman + dcLuminanceTable, acTable: huffman + acLuminanceTable,
+                predictor: &luma, to: &bits
+            )
+            encodeBlock(
+                block + 64, nonZero: masks[1],
+                dcTable: huffman + dcChrominanceTable, acTable: huffman + acChrominanceTable,
+                predictor: &blueChroma, to: &bits
+            )
+            encodeBlock(
+                block + 128, nonZero: masks[2],
+                dcTable: huffman + dcChrominanceTable, acTable: huffman + acChrominanceTable,
+                predictor: &redChroma, to: &bits
+            )
+            block += 192
+            masks += 3
+        }
+        predictors = (luma, blueChroma, redChroma)
+        writer = bits
+    }
+
+    /// Huffman-codes one already quantized, zigzag-ordered block, given the
+    /// bitmask of its non-zero coefficients.
+    @inline(__always)
+    private static func encodeBlock(
+        _ coefficients: UnsafePointer<Int16>,
+        nonZero: UInt64,
+        dcTable: UnsafePointer<UInt32>,
+        acTable: UnsafePointer<UInt32>,
         predictor: inout Int,
         to writer: inout JPEGBitWriter
     ) {
-        // Forward DCT.
-        var frequency = [Double](repeating: 0, count: 64)
-        for v in 0..<8 {
-            for u in 0..<8 {
-                var sum = 0.0
-                for y in 0..<8 {
-                    for x in 0..<8 {
-                        sum += plane[(originY + y) * planeWidth + originX + x]
-                            * cosineTable[u][x] * cosineTable[v][y]
-                    }
-                }
-                frequency[v * 8 + u] = sum * normalization[u] * normalization[v] / 4
-            }
-        }
-
-        var quantized = [Int](repeating: 0, count: 64)
-        for i in 0..<64 {
-            // The clamp keeps AC magnitudes within the 10 bits the standard
-            // Huffman tables can express (only reachable near quality 100).
-            quantized[i] = min(1023, max(-1023, Int((frequency[i] / Double(quantization[i])).rounded())))
-        }
-
         // DC coefficient, coded as the difference from the previous block.
-        let difference = quantized[0] - predictor
-        predictor = quantized[0]
+        let dc = Int(coefficients[0])
+        let difference = dc - predictor
+        predictor = dc
         let dcSize = bitSize(of: difference)
-        dcEncoder.write(dcSize, to: &writer)
-        writeAmplitude(difference, size: dcSize, to: &writer)
+        writer.write(
+            entry: dcTable[dcSize],
+            amplitude: amplitude(of: difference, size: dcSize),
+            amplitudeLength: dcSize
+        )
 
-        // AC coefficients in zigzag order with run-length coding.
-        var zeroRun = 0
-        for k in 1..<64 {
-            let value = quantized[zigzag[k]]
-            if value == 0 {
-                zeroRun += 1
-                continue
-            }
+        // AC coefficients in zigzag order with run-length coding. Walking the
+        // mask one set bit at a time visits only the coefficients that are
+        // actually coded: most of a block is zeros, and testing them
+        // individually would mean a branch per coefficient that no predictor
+        // can get right.
+        var remaining = nonZero & ~1  // the DC coefficient is already coded
+        var previous = 0
+        while remaining != 0 {
+            let k = remaining.trailingZeroBitCount
+            remaining &= remaining - 1
+            var zeroRun = k - previous - 1
+            previous = k
             while zeroRun > 15 {
-                acEncoder.write(0xF0, to: &writer)  // ZRL: sixteen zeros
+                writer.write(entry: acTable[0xF0], amplitude: 0, amplitudeLength: 0)  // ZRL: sixteen zeros
                 zeroRun -= 16
             }
+            let value = Int(coefficients[k])
             let size = bitSize(of: value)
-            acEncoder.write(zeroRun << 4 | size, to: &writer)
-            writeAmplitude(value, size: size, to: &writer)
-            zeroRun = 0
+            writer.write(
+                entry: acTable[zeroRun << 4 | size],
+                amplitude: amplitude(of: value, size: size),
+                amplitudeLength: size
+            )
         }
-        if zeroRun > 0 {
-            acEncoder.write(0x00, to: &writer)  // EOB
+        if previous < 63 {
+            writer.write(entry: acTable[0x00], amplitude: 0, amplitudeLength: 0)  // EOB
         }
     }
 
+    @inline(__always)
     private static func bitSize(of value: Int) -> Int {
-        Int.bitWidth - abs(value).leadingZeroBitCount
+        UInt.bitWidth - value.magnitude.leadingZeroBitCount
     }
 
-    private static func writeAmplitude(_ value: Int, size: Int, to writer: inout JPEGBitWriter) {
-        guard size > 0 else { return }
-        writer.writeBits(value < 0 ? value + (1 << size) - 1 : value, count: size)
-    }
-
-    /// Canonical JPEG Huffman codes for encoding, built from a standard
-    /// (counts, symbols) table definition.
-    private struct HuffmanEncoder {
-        private var codes = [Int](repeating: 0, count: 256)
-        private var lengths = [Int](repeating: 0, count: 256)
-
-        init(counts: [Int], symbols: [UInt8]) {
-            precondition(counts.reduce(0, +) == symbols.count, "Huffman counts must match symbol count")
-            var code = 0
-            var symbolIndex = 0
-            for length in 1...16 {
-                for _ in 0..<counts[length - 1] {
-                    let symbol = Int(symbols[symbolIndex])
-                    codes[symbol] = code
-                    lengths[symbol] = length
-                    code += 1
-                    symbolIndex += 1
-                }
-                code <<= 1
-            }
-        }
-
-        func write(_ symbol: Int, to writer: inout JPEGBitWriter) {
-            precondition(lengths[symbol] > 0, "Symbol missing from Huffman table")
-            writer.writeBits(codes[symbol], count: lengths[symbol])
-        }
+    /// The magnitude bits the standard prescribes: the value itself when
+    /// positive, its complement within `size` bits when negative. Written
+    /// branchlessly, since the sign is unpredictable.
+    @inline(__always)
+    private static func amplitude(of value: Int, size: Int) -> Int {
+        value + ((value >> (Int.bitWidth - 1)) & ((1 << size) - 1))
     }
 }
 
 /// Writes bits most-significant-bit first, stuffing a zero byte after every
 /// 0xFF as JPEG entropy coding requires; the final partial byte is padded
 /// with one bits.
+///
+/// Bits collect in a 64-bit window and drain a byte at a time into a manually
+/// grown buffer, so a whole Huffman symbol plus its amplitude costs one shift,
+/// one or, and one capacity check. The struct holds nothing but trivial
+/// values, so hot loops can copy it into locals and store it back once.
+/// `finish()` releases the buffer and must be called exactly once.
 private struct JPEGBitWriter {
-    private var bytes: [UInt8] = []
-    private var currentByte = 0
+    private var buffer: UnsafeMutablePointer<UInt8>
+    private var capacity: Int
+    private var count = 0
+    /// Pending bits, right-aligned in the low `bitCount` bits.
+    private var accumulator: UInt64 = 0
     private var bitCount = 0
 
-    mutating func writeBits(_ value: Int, count: Int) {
-        for i in (0..<count).reversed() {
-            currentByte = currentByte << 1 | (value >> i & 1)
-            bitCount += 1
-            if bitCount == 8 {
-                bytes.append(UInt8(currentByte))
-                if currentByte == 0xFF {
-                    bytes.append(0x00)
-                }
-                currentByte = 0
-                bitCount = 0
+    init(capacityHint: Int) {
+        capacity = max(4096, capacityHint)
+        buffer = .allocate(capacity: capacity)
+        buffer.initialize(repeating: 0, count: capacity)
+    }
+
+    /// Appends a `(length << 16 | code)` Huffman entry followed by its
+    /// amplitude bits. The two lengths never exceed 16 + 11: the standard
+    /// tables cap codes at 16 bits, and the ±1023 coefficient clamp caps a DC
+    /// difference at ±2046.
+    @inline(__always)
+    mutating func write(entry: UInt32, amplitude: Int, amplitudeLength: Int) {
+        assert(entry >> 16 > 0, "Symbol missing from Huffman table")
+        assert(amplitude >= 0, "Amplitude bits must be non-negative")
+        let length = Int(entry >> 16)
+        let amplitudeMask = (UInt64(1) << UInt64(amplitudeLength)) - 1
+        accumulator = (accumulator << UInt64(length + amplitudeLength))
+            | (UInt64(entry & 0xFFFF) << UInt64(amplitudeLength))
+            | (UInt64(amplitude) & amplitudeMask)
+        bitCount += length + amplitudeLength
+
+        // At most 27 new bits join up to seven pending ones, so this drains no
+        // more than four bytes plus four stuffed zeros.
+        if count + 8 > capacity {
+            (buffer, capacity) = Self.grown(buffer, capacity: capacity, count: count)
+        }
+        while bitCount >= 8 {
+            bitCount -= 8
+            let byte = UInt8(truncatingIfNeeded: accumulator >> UInt64(bitCount))
+            buffer[count] = byte
+            count += 1
+            if byte == 0xFF {
+                buffer[count] = 0
+                count += 1
             }
         }
     }
 
+    /// Doubles the buffer, keeping the bytes written so far. Taking and
+    /// returning plain values rather than mutating `self` keeps the writer
+    /// promotable to registers in the loops that inline `write`.
+    private static func grown(
+        _ buffer: UnsafeMutablePointer<UInt8>,
+        capacity: Int,
+        count: Int
+    ) -> (UnsafeMutablePointer<UInt8>, Int) {
+        let newCapacity = capacity * 2
+        let newBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: newCapacity)
+        newBuffer.initialize(repeating: 0, count: newCapacity)
+        newBuffer.update(from: buffer, count: count)
+        buffer.deallocate()
+        return (newBuffer, newCapacity)
+    }
+
+    /// Pads the final partial byte with one bits, releases the buffer and
+    /// returns the entropy-coded bytes.
     mutating func finish() -> [UInt8] {
-        while bitCount > 0 {
-            writeBits(1, count: 1)
+        if bitCount > 0 {
+            let padding = 8 - bitCount
+            write(
+                entry: UInt32(padding) << 16 | ((1 << UInt32(padding)) - 1),
+                amplitude: 0,
+                amplitudeLength: 0
+            )
         }
-        return bytes
+        let result = [UInt8](UnsafeBufferPointer(start: buffer, count: count))
+        buffer.deallocate()
+        capacity = 0
+        count = 0
+        return result
     }
 }
