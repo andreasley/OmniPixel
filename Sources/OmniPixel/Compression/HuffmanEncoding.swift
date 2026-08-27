@@ -5,10 +5,23 @@ struct HuffmanEncoding {
     let lengths: [Int]
     /// Canonical code per symbol, stored most-significant-bit first as DEFLATE writes them.
     let codes: [Int]
+    /// The same codes with their bits reversed, ready to drop straight into the
+    /// least-significant-bit-first stream without reversing them per symbol.
+    let reversedCodes: [Int]
 
     init(lengths: [Int]) {
         self.lengths = lengths
-        self.codes = Self.canonicalCodes(for: lengths)
+        let codes = Self.canonicalCodes(for: lengths)
+        self.codes = codes
+        self.reversedCodes = zip(codes, lengths).map { code, length in
+            var source = code
+            var reversed = 0
+            for _ in 0..<length {
+                reversed = reversed << 1 | (source & 1)
+                source >>= 1
+            }
+            return reversed
+        }
     }
 
     /// The number of bits this code needs for symbols occurring with `frequencies`

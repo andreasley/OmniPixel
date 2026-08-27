@@ -1,5 +1,15 @@
 /// A canonical Huffman decoding table built from code lengths (RFC 1951, section 3.2.2).
+///
+/// Codes of up to `primaryBits` bits — the overwhelming majority — resolve in a
+/// single indexed load; longer codes fall back to the canonical bit-by-bit walk.
 struct HuffmanTable {
+    /// Nine bits keeps the lookup at 512 entries while still covering almost
+    /// every code the DEFLATE and VP8L alphabets produce.
+    private static let primaryBits = 9
+
+    /// Indexed by the next `primaryBits` bits of the stream: (length << 16) |
+    /// symbol, or 0 when no code that short matches.
+    private let primary: [UInt32]
     /// countsByLength[n] is the number of codes that are n bits long (index 0 unused).
     private let countsByLength: [Int]
     /// Symbols sorted by code length, then by symbol value.
@@ -32,11 +42,57 @@ struct HuffmanTable {
             offsets[length] += 1
         }
 
+        // Assign canonical codes and fill the primary lookup. Codes are stored
+        // most significant bit first but arrive least significant bit first, so
+        // each one is reversed to index the table, and every table slot whose
+        // low bits match it gets the entry.
+        var nextCode = [Int](repeating: 0, count: 16)
+        var code = 0
+        for length in 1...15 {
+            code = (code + counts[length - 1]) << 1
+            nextCode[length] = code
+        }
+        var primary = [UInt32](repeating: 0, count: 1 << Self.primaryBits)
+        for (symbol, length) in codeLengths.enumerated() where length > 0 {
+            let assigned = nextCode[length]
+            nextCode[length] += 1
+            guard length <= Self.primaryBits else { continue }
+            let entry = UInt32(length) << 16 | UInt32(symbol)
+            var index = Self.reversingBits(of: assigned, count: length)
+            let step = 1 << length
+            while index < primary.count {
+                primary[index] = entry
+                index += step
+            }
+        }
+
+        self.primary = primary
         self.countsByLength = counts
         self.symbols = sortedSymbols
     }
 
+    private static func reversingBits(of value: Int, count: Int) -> Int {
+        var source = value
+        var result = 0
+        for _ in 0..<count {
+            result = result << 1 | (source & 1)
+            source >>= 1
+        }
+        return result
+    }
+
     func decodeSymbol(from reader: inout BitReader) throws -> Int {
+        let entry = primary[reader.peekBits(Self.primaryBits)]
+        guard entry != 0 else {
+            return try decodeLongSymbol(from: &reader)
+        }
+        try reader.consume(Int(entry >> 16))
+        return Int(entry & 0xFFFF)
+    }
+
+    /// The canonical walk, for codes the primary lookup can't reach. Nothing
+    /// has been consumed yet, so this starts from the same bit position.
+    private func decodeLongSymbol(from reader: inout BitReader) throws -> Int {
         var code = 0
         var first = 0
         var index = 0
@@ -54,10 +110,105 @@ struct HuffmanTable {
     }
 }
 
+/// The growing output window of an inflate run.
+///
+/// Back-references read from bytes already produced, so the buffer has to stay
+/// directly addressable while it grows. Managing the storage by hand keeps a
+/// literal down to a single store and lets a match move in machine words
+/// instead of a byte at a time.
+private struct InflateWindow {
+    private var storage: UnsafeMutablePointer<UInt8>
+    private var capacity: Int
+    private(set) var count = 0
+
+    init(capacityHint: Int) {
+        capacity = max(1024, capacityHint)
+        storage = .allocate(capacity: capacity)
+        storage.initialize(repeating: 0, count: capacity)
+    }
+
+    private mutating func reserve(_ additional: Int) {
+        guard count + additional > capacity else { return }
+        var newCapacity = max(capacity * 2, 1024)
+        while newCapacity < count + additional {
+            newCapacity *= 2
+        }
+        let newStorage = UnsafeMutablePointer<UInt8>.allocate(capacity: newCapacity)
+        newStorage.initialize(repeating: 0, count: newCapacity)
+        newStorage.update(from: storage, count: count)
+        storage.deallocate()
+        storage = newStorage
+        capacity = newCapacity
+    }
+
+    @inline(__always)
+    mutating func append(_ byte: UInt8) {
+        reserve(1)
+        storage[count] = byte
+        count += 1
+    }
+
+    mutating func append(_ bytes: [UInt8]) {
+        reserve(bytes.count)
+        bytes.withUnsafeBufferPointer { buffer in
+            if let base = buffer.baseAddress {
+                (storage + count).update(from: base, count: buffer.count)
+            }
+        }
+        count += bytes.count
+    }
+
+    /// Repeats `length` bytes starting `distance` back. The regions may overlap,
+    /// which DEFLATE uses deliberately to encode runs.
+    ///
+    /// `distance` must be between 1 and `count`: the caller checks it against
+    /// the stream, and this walks raw memory on the strength of that check.
+    @inline(__always)
+    mutating func repeatPrevious(distance: Int, length: Int) {
+        precondition(distance >= 1 && distance <= count, "back-reference outside the output")
+        reserve(length)
+        let source = storage + (count - distance)
+        let destination = storage + count
+        count += length
+
+        if distance >= length {
+            // Disjoint, so one straight copy.
+            destination.update(from: source, count: length)
+        } else {
+            // Overlapping: lay down one period, then keep doubling the region
+            // already in place so long runs still move in blocks.
+            destination.update(from: source, count: distance)
+            var written = distance
+            while written < length {
+                let step = min(written, length - written)
+                (destination + written).update(from: destination, count: step)
+                written += step
+            }
+        }
+    }
+
+    /// The bytes produced so far.
+    func bytes() -> [UInt8] {
+        [UInt8](UnsafeBufferPointer(start: storage, count: count))
+    }
+
+    /// Frees the storage. Idempotent, so the owner can release it from a
+    /// `defer` and a decode that throws part way through still gives it back.
+    mutating func release() {
+        guard capacity > 0 else { return }
+        storage.deallocate()
+        capacity = 0
+        count = 0
+    }
+}
+
 /// DEFLATE decompression (RFC 1951) and its zlib container (RFC 1950), in pure Swift.
 enum Inflate {
     /// Decompresses a zlib stream: 2-byte header, DEFLATE data, Adler-32 checksum.
-    static func zlibDecompress(_ input: [UInt8]) throws -> [UInt8] {
+    ///
+    /// `expectedSize`, when known, only sizes the output buffer up front; a
+    /// stream that produces more still decompresses correctly.
+    static func zlibDecompress(_ input: [UInt8], expectedSize: Int = 0) throws -> [UInt8] {
         guard input.count >= 6 else {
             throw ImageError.invalidData(reason: "zlib stream too short")
         }
@@ -73,7 +224,7 @@ enum Inflate {
             throw ImageError.unsupportedFeature(reason: "zlib preset dictionaries are not supported")
         }
 
-        let output = try decompressRaw(Array(input[2..<(input.count - 4)]))
+        let output = try decompress(input, range: 2..<(input.count - 4), expectedSize: expectedSize)
 
         let storedChecksum = UInt32(input[input.count - 4]) << 24
             | UInt32(input[input.count - 3]) << 16
@@ -86,9 +237,23 @@ enum Inflate {
     }
 
     /// Decompresses raw DEFLATE data.
-    static func decompressRaw(_ input: [UInt8]) throws -> [UInt8] {
-        var reader = BitReader(input)
-        var output: [UInt8] = []
+    static func decompressRaw(_ input: [UInt8], expectedSize: Int = 0) throws -> [UInt8] {
+        try decompress(input, range: 0..<input.count, expectedSize: expectedSize)
+    }
+
+    private static func decompress(
+        _ input: [UInt8],
+        range: Range<Int>,
+        expectedSize: Int
+    ) throws -> [UInt8] {
+        var reader = BitReader(input, range: range)
+        // Callers that know the output size pass it. Otherwise guess four bytes
+        // out per byte in, capped so a large compressed input can't turn into a
+        // far larger speculative allocation; the window grows if the guess is low.
+        var output = InflateWindow(
+            capacityHint: expectedSize > 0 ? expectedSize : min(range.count * 4, 8 << 20)
+        )
+        defer { output.release() }
 
         while true {
             let isFinal = try reader.readBit() == 1
@@ -109,26 +274,26 @@ enum Inflate {
                 break
             }
         }
-        return output
+        return output.bytes()
     }
 
     // MARK: Blocks
 
-    private static func copyStoredBlock(_ reader: inout BitReader, into output: inout [UInt8]) throws {
+    private static func copyStoredBlock(_ reader: inout BitReader, into output: inout InflateWindow) throws {
         let lengthBytes = try reader.readAlignedBytes(4)
         let length = Int(lengthBytes[0]) | Int(lengthBytes[1]) << 8
         let complement = Int(lengthBytes[2]) | Int(lengthBytes[3]) << 8
         guard length ^ complement == 0xFFFF else {
             throw ImageError.invalidData(reason: "Corrupt stored block length")
         }
-        output += try reader.readAlignedBytes(length)
+        output.append(try reader.readAlignedBytes(length))
     }
 
     private static func decodeBlock(
         _ reader: inout BitReader,
         literals: HuffmanTable,
         distances: HuffmanTable,
-        into output: inout [UInt8]
+        into output: inout InflateWindow
     ) throws {
         while true {
             let symbol = try literals.decodeSymbol(from: &reader)
@@ -150,15 +315,10 @@ enum Inflate {
                 }
                 let distance = DeflateSpec.distanceBases[distanceSymbol]
                     + (try reader.readBits(DeflateSpec.distanceExtraBits[distanceSymbol]))
-                guard distance <= output.count else {
+                guard distance >= 1, distance <= output.count else {
                     throw ImageError.invalidData(reason: "DEFLATE back-reference before start of output")
                 }
-
-                // Copy byte by byte: back-references may overlap their own output.
-                let start = output.count - distance
-                for i in 0..<length {
-                    output.append(output[start + i])
-                }
+                output.repeatPrevious(distance: distance, length: length)
             }
         }
     }

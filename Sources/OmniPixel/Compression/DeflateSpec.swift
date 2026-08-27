@@ -50,12 +50,26 @@ enum DeflateSpec {
         lengthSymbols[length]
     }
 
-    static func distanceSymbol(forDistance distance: Int) -> Int {
-        // 30 entries; a linear scan is fine at our throughput.
-        var symbol = distanceBases.count - 1
-        while distanceBases[symbol] > distance {
-            symbol -= 1
+    /// Maps a distance (1...32768) to its symbol. Distances up to 256 index
+    /// directly; above that every symbol range starts one past a multiple of
+    /// 128 and is a multiple of 128 wide, so the top bits identify the symbol.
+    private static let distanceSymbols: [UInt8] = {
+        var table = [UInt8](repeating: 0, count: 512)
+        for symbol in 0..<distanceBases.count {
+            let first = distanceBases[symbol]
+            let last = min(first + (1 << distanceExtraBits[symbol]) - 1, 32768)
+            for distance in first...last {
+                table[distanceIndex(of: distance)] = UInt8(symbol)
+            }
         }
-        return symbol
+        return table
+    }()
+
+    private static func distanceIndex(of distance: Int) -> Int {
+        distance <= 256 ? distance - 1 : 256 + ((distance - 1) >> 7)
+    }
+
+    static func distanceSymbol(forDistance distance: Int) -> Int {
+        Int(distanceSymbols[distanceIndex(of: distance)])
     }
 }

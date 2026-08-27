@@ -41,7 +41,11 @@ enum PNGCodec: ImageCodec {
             let typeBytes = try reader.readBytes(4)
             let chunkData = try reader.readBytes(length)
             let storedCRC = try reader.readUInt32BigEndian()
-            guard CRC32.checksum(of: typeBytes + chunkData) == storedCRC else {
+            // Checksum the type and the payload as two pieces; joining them
+            // would copy every IDAT an extra time.
+            var crc = CRC32.update(CRC32.initialValue, with: typeBytes)
+            crc = CRC32.update(crc, with: chunkData)
+            guard CRC32.finalize(crc) == storedCRC else {
                 throw ImageError.invalidData(reason: "PNG chunk CRC mismatch")
             }
 
@@ -58,7 +62,13 @@ enum PNGCodec: ImageCodec {
             case "tRNS":
                 transparency = chunkData
             case "IDAT":
-                compressedImageData += chunkData
+                // A single IDAT is the common case, and taking it whole avoids
+                // copying it into a growing buffer.
+                if compressedImageData.isEmpty {
+                    compressedImageData = chunkData
+                } else {
+                    compressedImageData += chunkData
+                }
             case "IEND":
                 sawEnd = true
             default:
@@ -73,8 +83,28 @@ enum PNGCodec: ImageCodec {
             throw ImageError.invalidData(reason: "Missing IDAT chunk")
         }
 
-        let raw = try Inflate.zlibDecompress(compressedImageData)
-        return try buildImage(header: header, raw: raw, palette: palette, transparency: transparency)
+        let channels = try channelCount(for: header.colorType)
+        var raw = try Inflate.zlibDecompress(
+            compressedImageData,
+            expectedSize: expectedRawSize(for: header, channels: channels)
+        )
+        return try buildImage(
+            header: header,
+            channels: channels,
+            raw: &raw,
+            palette: palette,
+            transparency: transparency
+        )
+    }
+
+    private static func channelCount(for colorType: Int) throws -> Int {
+        switch colorType {
+        case 0, 3: 1
+        case 4: 2
+        case 2: 3
+        case 6: 4
+        default: throw ImageError.invalidData(reason: "Unknown PNG color type")
+        }
     }
 
     private static func parseHeader(_ chunk: [UInt8]) throws -> Header {
@@ -132,208 +162,311 @@ enum PNGCodec: ImageCodec {
         Pass(xStart: 0, yStart: 1, xStep: 1, yStep: 2),
     ]
 
-    private static func buildImage(header: Header, raw: [UInt8], palette: [RGBA], transparency: [UInt8]) throws -> Image {
-        let channels: Int
-        switch header.colorType {
-        case 0, 3: channels = 1
-        case 4: channels = 2
-        case 2: channels = 3
-        case 6: channels = 4
-        default: throw ImageError.invalidData(reason: "Unknown PNG color type")
+    private static func passes(for header: Header) -> [Pass] {
+        header.isInterlaced ? adam7Passes : [Pass(xStart: 0, yStart: 0, xStep: 1, yStep: 1)]
+    }
+
+    /// The size in bytes of one pass's filtered rows, or zero if the pass
+    /// stores nothing.
+    private static func passSize(_ pass: Pass, header: Header, bitsPerPixel: Int) -> (width: Int, height: Int, bytesPerRow: Int) {
+        let width = pass.xStart < header.width
+            ? (header.width - pass.xStart + pass.xStep - 1) / pass.xStep
+            : 0
+        let height = pass.yStart < header.height
+            ? (header.height - pass.yStart + pass.yStep - 1) / pass.yStep
+            : 0
+        guard width > 0, height > 0 else { return (0, 0, 0) }
+        return (width, height, (width * bitsPerPixel + 7) / 8)
+    }
+
+    /// The exact length of the unfiltered stream the header implies, so the
+    /// inflate buffer can be sized once. Capped, so a corrupt header can't turn
+    /// into an enormous allocation — a stream that needs more still grows.
+    private static func expectedRawSize(for header: Header, channels: Int) -> Int {
+        let bitsPerPixel = header.bitDepth * channels
+        var total = 0
+        for pass in passes(for: header) {
+            let size = passSize(pass, header: header, bitsPerPixel: bitsPerPixel)
+            total += size.height * (size.bytesPerRow + 1)
         }
+        return min(total, 64 << 20)
+    }
+
+    /// Unfilters the raw stream in place and converts it to pixels. Rows are
+    /// reconstructed where they already sit in `raw`, so the row above is just
+    /// a pointer backwards and nothing is copied per row.
+    private static func buildImage(
+        header: Header,
+        channels: Int,
+        raw: inout [UInt8],
+        palette: [RGBA],
+        transparency: [UInt8]
+    ) throws -> Image {
         let bitsPerPixel = header.bitDepth * channels
         // Filters operate on bytes; sub-byte depths use a distance of one byte.
         let filterDistance = max(1, bitsPerPixel / 8)
-        let passes = header.isInterlaced
-            ? adam7Passes
-            : [Pass(xStart: 0, yStart: 0, xStep: 1, yStep: 1)]
 
         var pixels = [RGBA](repeating: .transparent, count: header.width * header.height)
-        var offset = 0
+        let converter = RowConverter(
+            header: header,
+            channels: channels,
+            palette: palette,
+            transparency: transparency
+        )
+        // The first row of every pass filters against an imaginary row of zeros.
+        let zeroRow = [UInt8](repeating: 0, count: (header.width * bitsPerPixel + 7) / 8 + 1)
 
-        for pass in passes {
-            // Each pass is filtered like an independent image of its own size.
-            let passWidth = pass.xStart < header.width
-                ? (header.width - pass.xStart + pass.xStep - 1) / pass.xStep
-                : 0
-            let passHeight = pass.yStart < header.height
-                ? (header.height - pass.yStart + pass.yStep - 1) / pass.yStep
-                : 0
-            guard passWidth > 0, passHeight > 0 else { continue }  // empty passes store nothing
+        var consumed = 0
+        let rawCount = raw.count
+        try raw.withUnsafeMutableBufferPointer { rawBuffer in
+            try pixels.withUnsafeMutableBufferPointer { pixelBuffer in
+                try zeroRow.withUnsafeBufferPointer { zeros in
+                    let rawBase = rawBuffer.baseAddress!
+                    let pixelBase = pixelBuffer.baseAddress!
+                    let zeroBase = zeros.baseAddress!
 
-            let bytesPerRow = (passWidth * bitsPerPixel + 7) / 8
-            guard raw.count - offset >= passHeight * (bytesPerRow + 1) else {
-                throw ImageError.invalidData(reason: "PNG image data doesn't match its dimensions")
-            }
-            var previousRow = [UInt8](repeating: 0, count: bytesPerRow)
+                    for pass in passes(for: header) {
+                        // Each pass is filtered like an independent image of its own size.
+                        let size = passSize(pass, header: header, bitsPerPixel: bitsPerPixel)
+                        guard size.height > 0 else { continue }  // empty passes store nothing
+                        guard rawCount - consumed >= size.height * (size.bytesPerRow + 1) else {
+                            throw ImageError.invalidData(reason: "PNG image data doesn't match its dimensions")
+                        }
 
-            for rowIndex in 0..<passHeight {
-                let filterType = raw[offset]
-                var row = Array(raw[(offset + 1)...(offset + bytesPerRow)])
-                offset += bytesPerRow + 1
-                try unfilter(&row, previous: previousRow, filterType: filterType, distance: filterDistance)
-                previousRow = row
+                        for rowIndex in 0..<size.height {
+                            let filterType = rawBase[consumed]
+                            let row = rawBase + consumed + 1
+                            let previous = rowIndex == 0 ? zeroBase : UnsafePointer(row - (size.bytesPerRow + 1))
+                            try unfilter(
+                                row,
+                                previous: previous,
+                                count: size.bytesPerRow,
+                                filterType: filterType,
+                                distance: filterDistance
+                            )
+                            consumed += size.bytesPerRow + 1
 
-                let samples = extractSamples(from: row, bitDepth: header.bitDepth, count: passWidth * channels)
-                let rowPixels = try convertRow(
-                    samples: samples,
-                    header: header,
-                    channels: channels,
-                    palette: palette,
-                    transparency: transparency
-                )
-
-                let y = pass.yStart + rowIndex * pass.yStep
-                for (i, pixel) in rowPixels.enumerated() {
-                    pixels[y * header.width + pass.xStart + i * pass.xStep] = pixel
+                            let y = pass.yStart + rowIndex * pass.yStep
+                            try converter.convert(
+                                row,
+                                into: pixelBase + y * header.width + pass.xStart,
+                                step: pass.xStep,
+                                count: size.width
+                            )
+                        }
+                    }
                 }
             }
         }
 
-        guard offset == raw.count else {
+        guard consumed == rawCount else {
             throw ImageError.invalidData(reason: "PNG image data doesn't match its dimensions")
         }
         return Image(width: header.width, height: header.height, pixels: pixels)
     }
 
-    /// Extracts full-precision samples from an unfiltered row: sub-byte samples
-    /// are packed most significant bits first, 16-bit samples are big-endian.
-    private static func extractSamples(from row: [UInt8], bitDepth: Int, count: Int) -> [Int] {
-        var samples: [Int] = []
-        samples.reserveCapacity(count)
-        switch bitDepth {
-        case 8:
-            for i in 0..<count {
-                samples.append(Int(row[i]))
-            }
-        case 16:
-            for i in 0..<count {
-                samples.append(Int(row[i * 2]) << 8 | Int(row[i * 2 + 1]))
-            }
-        default:
-            let mask = (1 << bitDepth) - 1
-            var bitPosition = 0
-            while samples.count < count {
-                let shift = 8 - bitDepth - (bitPosition % 8)
-                samples.append(Int(row[bitPosition / 8] >> shift) & mask)
-                bitPosition += bitDepth
+    /// Turns unfiltered row bytes into pixels. Everything that depends only on
+    /// the header — the sample scaling, the tRNS colors — is resolved once here
+    /// instead of once per row.
+    private struct RowConverter {
+        private let bitDepth: Int
+        private let colorType: Int
+        private let channels: Int
+        private let palette: [RGBA]
+        private let transparency: [UInt8]
+        private let maxSample: Int
+        private let transparentGray: Int?
+        private let transparentColor: (red: Int, green: Int, blue: Int)?
+
+        init(header: Header, channels: Int, palette: [RGBA], transparency: [UInt8]) {
+            bitDepth = header.bitDepth
+            colorType = header.colorType
+            self.channels = channels
+            self.palette = palette
+            self.transparency = transparency
+            maxSample = (1 << header.bitDepth) - 1
+
+            // tRNS for grayscale/truecolor names one fully transparent color, with
+            // each component stored as two bytes regardless of bit depth. Matching
+            // uses the full-precision samples so 16-bit colors compare exactly.
+            transparentGray = header.colorType == 0 && transparency.count >= 2
+                ? Int(transparency[0]) << 8 | Int(transparency[1])
+                : nil
+            transparentColor = header.colorType == 2 && transparency.count >= 6
+                ? (
+                    red: Int(transparency[0]) << 8 | Int(transparency[1]),
+                    green: Int(transparency[2]) << 8 | Int(transparency[3]),
+                    blue: Int(transparency[4]) << 8 | Int(transparency[5])
+                )
+                : nil
+        }
+
+        /// Writes `count` pixels, `step` apart, starting at `destination`
+        /// (Adam7 passes land on a sparse grid).
+        func convert(
+            _ row: UnsafePointer<UInt8>,
+            into destination: UnsafeMutablePointer<RGBA>,
+            step: Int,
+            count: Int
+        ) throws {
+            // Eight-bit truecolor needs no scaling and no sample unpacking, and
+            // is what almost every real file uses.
+            if bitDepth == 8, colorType == 6 {
+                for x in 0..<count {
+                    let base = x * 4
+                    destination[x * step] = RGBA(
+                        red: row[base],
+                        green: row[base + 1],
+                        blue: row[base + 2],
+                        alpha: row[base + 3]
+                    )
+                }
+            } else if bitDepth == 8, colorType == 2, transparentColor == nil {
+                for x in 0..<count {
+                    let base = x * 3
+                    destination[x * step] = RGBA(red: row[base], green: row[base + 1], blue: row[base + 2])
+                }
+            } else {
+                try convertGeneral(row, into: destination, step: step, count: count)
             }
         }
-        return samples
-    }
 
-    private static func convertRow(
-        samples: [Int],
-        header: Header,
-        channels: Int,
-        palette: [RGBA],
-        transparency: [UInt8]
-    ) throws -> [RGBA] {
-        // Reduce a full-precision sample to 8 bits.
-        let maxSample = (1 << header.bitDepth) - 1
-        func scaled(_ value: Int) -> UInt8 {
-            switch header.bitDepth {
+        private func convertGeneral(
+            _ row: UnsafePointer<UInt8>,
+            into destination: UnsafeMutablePointer<RGBA>,
+            step: Int,
+            count: Int
+        ) throws {
+            for x in 0..<count {
+                let base = x * channels
+                switch colorType {
+                case 0:
+                    let gray = sample(row, base)
+                    let value = scaled(gray)
+                    destination[x * step] = RGBA(
+                        red: value,
+                        green: value,
+                        blue: value,
+                        alpha: gray == transparentGray ? 0 : 255
+                    )
+                case 2:
+                    let red = sample(row, base)
+                    let green = sample(row, base + 1)
+                    let blue = sample(row, base + 2)
+                    var pixel = RGBA(red: scaled(red), green: scaled(green), blue: scaled(blue))
+                    if let transparentColor,
+                       red == transparentColor.red,
+                       green == transparentColor.green,
+                       blue == transparentColor.blue {
+                        pixel.alpha = 0
+                    }
+                    destination[x * step] = pixel
+                case 3:
+                    let index = sample(row, base)
+                    guard index < palette.count else {
+                        throw ImageError.invalidData(reason: "PNG palette index out of range")
+                    }
+                    var pixel = palette[index]
+                    if index < transparency.count {
+                        pixel.alpha = transparency[index]
+                    }
+                    destination[x * step] = pixel
+                case 4:
+                    let value = scaled(sample(row, base))
+                    destination[x * step] = RGBA(
+                        red: value,
+                        green: value,
+                        blue: value,
+                        alpha: scaled(sample(row, base + 1))
+                    )
+                default:  // 6, already validated
+                    destination[x * step] = RGBA(
+                        red: scaled(sample(row, base)),
+                        green: scaled(sample(row, base + 1)),
+                        blue: scaled(sample(row, base + 2)),
+                        alpha: scaled(sample(row, base + 3))
+                    )
+                }
+            }
+        }
+
+        /// Reads one sample at full precision: sub-byte samples are packed most
+        /// significant bits first, 16-bit samples are big-endian.
+        @inline(__always)
+        private func sample(_ row: UnsafePointer<UInt8>, _ index: Int) -> Int {
+            switch bitDepth {
+            case 8:
+                return Int(row[index])
+            case 16:
+                return Int(row[index * 2]) << 8 | Int(row[index * 2 + 1])
+            default:
+                let bitPosition = index * bitDepth
+                let shift = 8 - bitDepth - bitPosition % 8
+                return Int(row[bitPosition / 8] >> shift) & maxSample
+            }
+        }
+
+        /// Reduces a full-precision sample to 8 bits.
+        @inline(__always)
+        private func scaled(_ value: Int) -> UInt8 {
+            switch bitDepth {
             case 16: UInt8(value >> 8)
             case 8: UInt8(value)
             default: UInt8(value * 255 / maxSample)
             }
         }
-
-        // tRNS for grayscale/truecolor names one fully transparent color, with
-        // each component stored as two bytes regardless of bit depth. Matching
-        // uses the full-precision samples so 16-bit colors compare exactly.
-        var transparentGray: Int?
-        var transparentColor: (red: Int, green: Int, blue: Int)?
-        if header.colorType == 0, transparency.count >= 2 {
-            transparentGray = Int(transparency[0]) << 8 | Int(transparency[1])
-        }
-        if header.colorType == 2, transparency.count >= 6 {
-            transparentColor = (
-                red: Int(transparency[0]) << 8 | Int(transparency[1]),
-                green: Int(transparency[2]) << 8 | Int(transparency[3]),
-                blue: Int(transparency[4]) << 8 | Int(transparency[5])
-            )
-        }
-
-        let width = samples.count / channels
-        var pixels: [RGBA] = []
-        pixels.reserveCapacity(width)
-
-        for x in 0..<width {
-            let base = x * channels
-            switch header.colorType {
-            case 0:
-                let value = scaled(samples[base])
-                let alpha: UInt8 = samples[base] == transparentGray ? 0 : 255
-                pixels.append(RGBA(red: value, green: value, blue: value, alpha: alpha))
-            case 2:
-                var pixel = RGBA(
-                    red: scaled(samples[base]),
-                    green: scaled(samples[base + 1]),
-                    blue: scaled(samples[base + 2])
-                )
-                if let transparentColor,
-                   samples[base] == transparentColor.red,
-                   samples[base + 1] == transparentColor.green,
-                   samples[base + 2] == transparentColor.blue {
-                    pixel.alpha = 0
-                }
-                pixels.append(pixel)
-            case 3:
-                let index = samples[base]
-                guard index < palette.count else {
-                    throw ImageError.invalidData(reason: "PNG palette index out of range")
-                }
-                var color = palette[index]
-                if index < transparency.count {
-                    color.alpha = transparency[index]
-                }
-                pixels.append(color)
-            case 4:
-                let value = scaled(samples[base])
-                pixels.append(RGBA(red: value, green: value, blue: value, alpha: scaled(samples[base + 1])))
-            default:  // 6, already validated
-                pixels.append(RGBA(
-                    red: scaled(samples[base]),
-                    green: scaled(samples[base + 1]),
-                    blue: scaled(samples[base + 2]),
-                    alpha: scaled(samples[base + 3])
-                ))
-            }
-        }
-        return pixels
     }
 
     // MARK: Filters
 
-    private static func unfilter(_ row: inout [UInt8], previous: [UInt8], filterType: UInt8, distance: Int) throws {
+    /// Reverses one row's filter in place. `previous` points at the already
+    /// unfiltered row above, or at zeros for the first row of a pass.
+    private static func unfilter(
+        _ row: UnsafeMutablePointer<UInt8>,
+        previous: UnsafePointer<UInt8>,
+        count: Int,
+        filterType: UInt8,
+        distance: Int
+    ) throws {
+        // The first `distance` bytes have no left neighbour, so the predictors
+        // that use one degenerate; splitting them out keeps the main loop clean.
+        let leading = min(distance, count)
         switch filterType {
         case 0:
             break
         case 1:  // Sub
-            for i in row.indices where i >= distance {
+            for i in leading..<count {
                 row[i] &+= row[i - distance]
             }
         case 2:  // Up
-            for i in row.indices {
+            for i in 0..<count {
                 row[i] &+= previous[i]
             }
         case 3:  // Average
-            for i in row.indices {
-                let left = i >= distance ? Int(row[i - distance]) : 0
-                row[i] &+= UInt8((left + Int(previous[i])) / 2)
+            for i in 0..<leading {
+                row[i] &+= previous[i] >> 1
+            }
+            for i in leading..<count {
+                row[i] &+= UInt8((UInt32(row[i - distance]) + UInt32(previous[i])) >> 1)
             }
         case 4:  // Paeth
-            for i in row.indices {
-                let left = i >= distance ? row[i - distance] : 0
-                let upLeft = i >= distance ? previous[i - distance] : 0
-                row[i] &+= paethPredictor(left: left, up: previous[i], upLeft: upLeft)
+            for i in 0..<leading {
+                // With left and up-left both zero, Paeth always predicts up.
+                row[i] &+= previous[i]
+            }
+            for i in leading..<count {
+                row[i] &+= paethPredictor(
+                    left: row[i - distance],
+                    up: previous[i],
+                    upLeft: previous[i - distance]
+                )
             }
         default:
             throw ImageError.invalidData(reason: "Unknown PNG filter type")
         }
     }
 
+    @inline(__always)
     private static func paethPredictor(left: UInt8, up: UInt8, upLeft: UInt8) -> UInt8 {
         let a = Int(left)
         let b = Int(up)
@@ -371,75 +504,130 @@ enum PNGCodec: ImageCodec {
             writeChunk(type: "eXIf", data: exif.serializedPayload(), to: &writer)
         }
 
-        let bytesPerRow = image.width * 4
-        var raw: [UInt8] = []
-        raw.reserveCapacity(image.height * (bytesPerRow + 1))
-        var previousRow = [UInt8](repeating: 0, count: bytesPerRow)
-        var currentRow = [UInt8](repeating: 0, count: bytesPerRow)
-
-        for y in 0..<image.height {
-            for x in 0..<image.width {
-                let pixel = image.pixels[y * image.width + x]
-                currentRow[x * 4] = pixel.red
-                currentRow[x * 4 + 1] = pixel.green
-                currentRow[x * 4 + 2] = pixel.blue
-                currentRow[x * 4 + 3] = pixel.alpha
-            }
-            let best = bestFilter(for: currentRow, previous: previousRow, distance: 4)
-            raw.append(best.type)
-            raw += best.bytes
-            swap(&previousRow, &currentRow)
-        }
-
-        writeChunk(type: "IDAT", data: Deflate.zlibCompress(raw), to: &writer)
+        writeChunk(type: "IDAT", data: Deflate.zlibCompress(filteredRows(of: image)), to: &writer)
         writeChunk(type: "IEND", data: [], to: &writer)
         return writer.data
+    }
+
+    /// Builds the filtered byte stream DEFLATE compresses: one filter-type byte
+    /// per row followed by that row's residuals.
+    private static func filteredRows(of image: Image) -> [UInt8] {
+        let bytesPerRow = image.width * 4
+        var raw = [UInt8](repeating: 0, count: image.height * (bytesPerRow + 1))
+        // The current and previous unfiltered rows, back to back. The previous
+        // row starts out zeroed, which is what PNG assumes above the image.
+        var rows = [UInt8](repeating: 0, count: 2 * bytesPerRow)
+        var candidates = [UInt8](repeating: 0, count: 5 * bytesPerRow)
+
+        image.pixels.withUnsafeBufferPointer { pixels in
+            raw.withUnsafeMutableBufferPointer { rawBuffer in
+                rows.withUnsafeMutableBufferPointer { rowBuffer in
+                    candidates.withUnsafeMutableBufferPointer { candidateBuffer in
+                        var current = rowBuffer.baseAddress!
+                        var previous = current + bytesPerRow
+                        var output = rawBuffer.baseAddress!
+                        let source = pixels.baseAddress!
+
+                        for y in 0..<image.height {
+                            let rowPixels = source + y * image.width
+                            for x in 0..<image.width {
+                                let pixel = rowPixels[x]
+                                current[x * 4] = pixel.red
+                                current[x * 4 + 1] = pixel.green
+                                current[x * 4 + 2] = pixel.blue
+                                current[x * 4 + 3] = pixel.alpha
+                            }
+                            let choice = chooseFilter(
+                                row: current,
+                                previous: previous,
+                                count: bytesPerRow,
+                                candidates: candidateBuffer.baseAddress!
+                            )
+                            output.pointee = choice.type
+                            (output + 1).update(from: choice.bytes, count: bytesPerRow)
+                            output += bytesPerRow + 1
+                            swap(&current, &previous)
+                        }
+                    }
+                }
+            }
+        }
+        return raw
     }
 
     /// Filters the row all five ways and keeps the one whose output has the
     /// smallest sum of absolute residuals (libpng's selection heuristic) —
     /// small residuals are what DEFLATE compresses best.
-    private static func bestFilter(for row: [UInt8], previous: [UInt8], distance: Int) -> (type: UInt8, bytes: [UInt8]) {
-        var bestType: UInt8 = 0
-        var bestBytes = row
-        var bestScore = residualScore(of: row)
+    ///
+    /// The five candidates are produced in one pass, so each source byte and its
+    /// neighbours are read once and the scratch buffer is reused across rows.
+    private static func chooseFilter(
+        row: UnsafePointer<UInt8>,
+        previous: UnsafePointer<UInt8>,
+        count: Int,
+        candidates: UnsafeMutablePointer<UInt8>
+    ) -> (type: UInt8, bytes: UnsafePointer<UInt8>) {
+        let distance = 4
+        let none = candidates
+        let sub = candidates + count
+        let up = candidates + 2 * count
+        let average = candidates + 3 * count
+        let paeth = candidates + 4 * count
 
-        for filterType: UInt8 in 1...4 {
-            var filtered = [UInt8](repeating: 0, count: row.count)
-            for i in row.indices {
-                let left = i >= distance ? row[i - distance] : 0
-                let up = previous[i]
-                let prediction: UInt8
-                switch filterType {
-                case 1:
-                    prediction = left
-                case 2:
-                    prediction = up
-                case 3:
-                    prediction = UInt8((Int(left) + Int(up)) / 2)
-                default:
-                    let upLeft = i >= distance ? previous[i - distance] : 0
-                    prediction = paethPredictor(left: left, up: up, upLeft: upLeft)
-                }
-                filtered[i] = row[i] &- prediction
-            }
-            let score = residualScore(of: filtered)
-            if score < bestScore {
-                bestType = filterType
-                bestBytes = filtered
-                bestScore = score
-            }
+        var noneScore = 0
+        var subScore = 0
+        var upScore = 0
+        var averageScore = 0
+        var paethScore = 0
+
+        for i in 0..<count {
+            let value = row[i]
+            let left = i >= distance ? row[i - distance] : 0
+            let above = previous[i]
+            let aboveLeft = i >= distance ? previous[i - distance] : 0
+
+            let subValue = value &- left
+            let upValue = value &- above
+            let averageValue = value &- UInt8((UInt32(left) + UInt32(above)) >> 1)
+            let paethValue = value &- paethPredictor(left: left, up: above, upLeft: aboveLeft)
+
+            none[i] = value
+            sub[i] = subValue
+            up[i] = upValue
+            average[i] = averageValue
+            paeth[i] = paethValue
+
+            noneScore += residual(value)
+            subScore += residual(subValue)
+            upScore += residual(upValue)
+            averageScore += residual(averageValue)
+            paethScore += residual(paethValue)
         }
-        return (bestType, bestBytes)
+
+        // Ties go to the lower filter type.
+        var bestType: UInt8 = 0
+        var bestScore = noneScore
+        var best = UnsafePointer(none)
+        if subScore < bestScore {
+            (bestType, bestScore, best) = (1, subScore, UnsafePointer(sub))
+        }
+        if upScore < bestScore {
+            (bestType, bestScore, best) = (2, upScore, UnsafePointer(up))
+        }
+        if averageScore < bestScore {
+            (bestType, bestScore, best) = (3, averageScore, UnsafePointer(average))
+        }
+        if paethScore < bestScore {
+            (bestType, best) = (4, UnsafePointer(paeth))
+        }
+        return (bestType, best)
     }
 
-    /// Sum of absolute values, interpreting each filtered byte as signed.
-    private static func residualScore(of bytes: [UInt8]) -> Int {
-        var total = 0
-        for byte in bytes {
-            total += min(Int(byte), 256 - Int(byte))
-        }
-        return total
+    /// Absolute value of a filtered byte, read as signed.
+    @inline(__always)
+    private static func residual(_ byte: UInt8) -> Int {
+        let value = Int(byte)
+        return min(value, 256 - value)
     }
 
     private static func writeChunk(type: String, data: [UInt8], to writer: inout ByteWriter) {
@@ -447,6 +635,8 @@ enum PNGCodec: ImageCodec {
         writer.writeUInt32BigEndian(UInt32(data.count))
         writer.writeBytes(typeBytes)
         writer.writeBytes(data)
-        writer.writeUInt32BigEndian(CRC32.checksum(of: typeBytes + data))
+        var crc = CRC32.update(CRC32.initialValue, with: typeBytes)
+        crc = CRC32.update(crc, with: data)
+        writer.writeUInt32BigEndian(CRC32.finalize(crc))
     }
 }
