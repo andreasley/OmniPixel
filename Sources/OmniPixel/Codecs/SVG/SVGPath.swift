@@ -202,6 +202,10 @@ extension SVGPathBuilder {
             if !isLetter {
                 if effective == "M" { effective = "L" }
                 if effective == "m" { effective = "l" }
+                // Z takes no arguments, so repeating it consumes no input;
+                // anything but a command letter after it is an error, and
+                // looping on it would never terminate.
+                if effective == "Z" || effective == "z" { return }
                 command = effective
             }
 

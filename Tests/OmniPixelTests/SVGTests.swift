@@ -144,6 +144,18 @@ import Testing
         #expect(image[2, 2].alpha == 0)
     }
 
+    @Test func numberAfterCloseStopsParsing() throws {
+        // A number where only a command may follow `z` is a spec error: the
+        // shape so far renders, the rest is dropped. Found by the fuzzer —
+        // repeating the zero-argument `z` for the stray number consumed no
+        // input, so parsing never advanced and the decoder hung.
+        let image = try decode(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">"
+            + "<path d=\"M1 1 H9 V9 H1 z -0.4-0.2 M0 0 H10 V10\" fill=\"black\"/></svg>")
+        #expect(image[5, 5] == .black)
+        #expect(image[0, 0].alpha == 0)  // the trailing subpath was dropped
+    }
+
     @Test func relativeCommandsAndImplicitLineTo() throws {
         // "m" then implicit relative lineto pairs.
         let image = try decode(
