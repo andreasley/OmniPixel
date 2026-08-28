@@ -59,10 +59,20 @@ enum FuzzBudget {
     /// so a reported seed replays the whole run exactly.
     static let seed = UInt64(integer(named: "OMNIPIXEL_FUZZ_SEED", default: 0x243F_6A88))
 
-    /// Minutes any one randomized test may take. A backstop against a decoder
-    /// that loops instead of rejecting: see the README on why this cannot be a
-    /// per-case check.
-    static let timeLimitMinutes = integer(named: "OMNIPIXEL_FUZZ_MINUTES", default: 10)
+    /// Minutes any one randomized test may take.
+    ///
+    /// Scaled with the budget, because the work here is deliberately
+    /// user-configurable: a fixed limit would fail exactly the long runs it is
+    /// meant to protect, and a debug or sanitizer build is an order of magnitude
+    /// slower again. Generous on purpose — this only has to notice a decoder
+    /// stuck in a loop, not police throughput.
+    static let timeLimitMinutes: Int = {
+        if let text = ProcessInfo.processInfo.environment["OMNIPIXEL_FUZZ_MINUTES"],
+           let parsed = Int(text), parsed > 0 {
+            return parsed
+        }
+        return max(30, iterations / 100)
+    }()
 
     private static func integer(named name: String, default fallback: Int) -> Int {
         guard let text = ProcessInfo.processInfo.environment[name],

@@ -38,7 +38,7 @@ plan can also include or exclude them as a group.
 | `OMNIPIXEL_FUZZ` | Enables the fuzz suites regardless of how tests were selected. |
 | `OMNIPIXEL_FUZZ_ITERATIONS` | Cases per test (default 5000). |
 | `OMNIPIXEL_FUZZ_SEED` | Base seed; replays a reported failure exactly. |
-| `OMNIPIXEL_FUZZ_MINUTES` | Time limit per test, the backstop against a looping decoder (default 10). |
+| `OMNIPIXEL_FUZZ_MINUTES` | Time limit per test. Defaults to `max(30, iterations / 100)`, so raising the budget does not fail the run. |
 
 ## Reproducing a failure
 
@@ -76,11 +76,23 @@ input.
   encoders, plus the repository's `Samples/` directory for the formats that are
   decode-only (AVIF, HEIC, SVG).
 
-- There is deliberately no per-case timer. A decoder stuck in a loop never
-  returns, so nothing measured *after* a decode can ever report it, and a
-  wall-clock check before it would fire spuriously whenever the machine is busy —
-  which is exactly when a long fuzz session runs. Hangs are the suite time
-  limit's job, and resource exhaustion is not what these suites measure.
+- The time limit is advisory. Swift Testing records an issue when it expires but
+  cannot interrupt a synchronous test body, so a decoder genuinely stuck in a
+  loop will log the issue and then keep the run wedged; a job timeout is what
+  actually stops it. The limit scales with the budget precisely so that a long
+  deliberate run does not trip it — if you see it fire, check the iteration
+  count before suspecting the library.
+
+- There is deliberately no per-case timer either. A decoder stuck in a loop
+  never returns, so nothing measured *after* a decode can report it, and a
+  wall-clock check would fire spuriously whenever the machine is busy — which is
+  exactly when a long fuzz session runs.
+
+- Cost per case varies enormously by format. Decoding a mutated BMP is
+  microseconds; a mutated AVIF or HEIC runs a full AV1 or HEVC decoder, which is
+  why `mutatedSampleFilesNeverCrash` takes a tenth of the budget. Keep input
+  *generation* out of the loop: seeds are encoded once and reused, since
+  encoding a PNG costs far more than decoding the corrupted result.
 
 - These are randomized tests, so a green run proves less than a green
   deterministic one. What they buy is that the space they cover grows with the

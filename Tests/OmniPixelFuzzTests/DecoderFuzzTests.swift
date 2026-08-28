@@ -162,19 +162,31 @@ struct PNGStructureFuzzTests {
         }
     }
 
+    /// Valid PNGs for the deflate-stream cases to corrupt. Compressed with our
+    /// own encoder, so the bytes being mutated are a real dynamic-Huffman
+    /// stream rather than the stored blocks `PNGBuilder` emits. Encoding one
+    /// costs far more than decoding the corrupted result, so the pool is built
+    /// once instead of per case — otherwise most of the budget goes on
+    /// producing inputs rather than testing the decoder.
+    private static let compressedSeeds: [[UInt8]] = {
+        [(7, 5), (16, 16), (33, 21), (40, 40)].compactMap { width, height in
+            guard let data = try? FuzzCorpus.sampleImage(width: width, height: height)
+                .encoded(as: .png) else { return nil }
+            return [UInt8](data)
+        }
+    }()
+
     /// Byte noise inside a well-formed container with the CRCs repaired, so
     /// corruption lands in the zlib stream and the Huffman tables.
     @Test("corrupt compressed data is rejected, not fatal")
-    func corruptCompressedDataNeverCrashes() {
+    func corruptCompressedDataNeverCrashes() throws {
+        try #require(!Self.compressedSeeds.isEmpty, "the encoder produced no seed files")
+
         let oracle = FuzzOracle(label: "PNG deflate stream")
         for iteration in 0..<FuzzBudget.iterations {
             let seed = FuzzBudget.seed &+ UInt64(iteration) &* 0x4E37_7975
             var random = FuzzRandom(seed: seed)
-            let layout = Self.randomLayout(using: &random)
-            // Compress with our own encoder, so the bytes being corrupted are a
-            // real dynamic-Huffman stream rather than stored blocks.
-            guard let valid = try? PNGBuilder.expectedImage(layout).encoded(as: .png) else { continue }
-            var bytes = [UInt8](valid)
+            var bytes = Self.compressedSeeds[random.below(Self.compressedSeeds.count)]
 
             for _ in 0..<(1 + random.below(16)) where !bytes.isEmpty {
                 let index = random.below(bytes.count)
