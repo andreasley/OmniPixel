@@ -2,12 +2,12 @@ import Foundation
 
 /// AVIF (AV1 still images in a HEIF container).
 ///
-/// The container layer is fully implemented — it is the same ISOBMFF
-/// structure HEIC uses — and the AV1 configuration record, OBU framing and
-/// sequence header are parsed. Reconstructing pixels requires the AV1
-/// entropy decoder and prediction stages, which are being built milestone
-/// by milestone; until they land, decoding throws
-/// `ImageError.unsupportedFeature` naming the missing stage.
+/// The container layer is the same ISOBMFF structure HEIC uses. Decoding
+/// runs the built-in AV1 intra decoder end to end — OBU framing, entropy
+/// decoding, prediction, reconstruction and the in-loop filters — including
+/// alpha auxiliaries, grid images and the container's rotation and mirror
+/// transforms. Encoding would require an AV1 encoder and throws
+/// `ImageError.unsupportedFeature`.
 enum AVIFCodec: ImageCodec {
     private static let avifBrands: Set<String> = ["avif", "avis"]
 

@@ -9,8 +9,7 @@ public enum ImageFormat: String, CaseIterable, Sendable {
     case webp
     /// Decoded by the built-in HEVC intra decoder; encoding is unsupported.
     case heic
-    /// Recognized and container-parsed; decoding requires the AV1 decoder,
-    /// which is under construction — `decode` throws `unsupportedFeature`.
+    /// Decoded by the built-in AV1 intra decoder; encoding is unsupported.
     case avif
     case bmp
     case qoi
