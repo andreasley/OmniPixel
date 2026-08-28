@@ -204,6 +204,22 @@ enum JPEGCodec: ImageCodec {
             let componentHeight = (height * vertical + frame.maxVerticalSampling - 1) / frame.maxVerticalSampling
             frame.components[index].scanBlockColumns = (componentWidth + 7) / 8
             frame.components[index].scanBlockRows = (componentHeight + 7) / 8
+        }
+
+        // Coefficient storage is far larger than the image itself — eight bytes
+        // per coefficient, sixty-four per block — so the dimensions must be
+        // sanity-checked against the data before any of it is allocated.
+        // Every block costs at least one bit of entropy-coded data, since its DC
+        // value is always Huffman-coded, so no valid frame can declare more
+        // blocks than the rest of the file could possibly encode. That bound is
+        // generous enough never to reject a real image, and it stops a few
+        // hundred bytes claiming huge dimensions from asking for gigabytes.
+        let totalBlocks = frame.components.reduce(0) { $0 + $1.blockColumns * $1.blockRows }
+        guard totalBlocks <= reader.remainingCount * 8 else {
+            throw ImageError.invalidData(reason: "JPEG frame declares more blocks than the file can encode")
+        }
+
+        for index in frame.components.indices {
             frame.components[index].coefficients = [Int](
                 repeating: 0,
                 count: frame.components[index].blockColumns * frame.components[index].blockRows * 64
