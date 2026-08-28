@@ -302,6 +302,24 @@ import UniformTypeIdentifiers
         #expect(highError <= 8)
     }
 
+    /// A scan header may only select Huffman table slots 0...3. A file naming a
+    /// higher slot used to index past the four-entry table array and abort the
+    /// process; found by the randomized suite in OmniPixelFuzzTests.
+    @Test func rejectsJPEGScanWithOutOfRangeHuffmanTableSelector() throws {
+        var bytes = [UInt8](try makeSmoothTestImage(width: 16, height: 16).encoded(as: .jpeg))
+        let sos = try #require(
+            (0..<(bytes.count - 1)).first { bytes[$0] == 0xFF && bytes[$0 + 1] == 0xDA },
+            "encoder produced no start-of-scan marker"
+        )
+        // FFDA, length (2), component count (1), then the first component's
+        // identifier (1) and its DC/AC table selector nibbles.
+        bytes[sos + 6] = 0x40  // DC selector 4, which no table slot can hold
+
+        #expect(throws: ImageError.self) {
+            _ = try Image(data: Data(bytes))
+        }
+    }
+
     #if canImport(ImageIO)
     @Test func decodesProgressiveJPEG() throws {
         // ImageIO writes a real multi-scan progressive JPEG (SOF2 with

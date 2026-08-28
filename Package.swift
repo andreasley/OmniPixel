@@ -50,6 +50,7 @@ let package = Package(
         .testTarget(
             name: "OmniPixelFuzzTests",
             dependencies: ["OmniPixel"],
+            exclude: ["README.md"],
             swiftSettings: [
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],

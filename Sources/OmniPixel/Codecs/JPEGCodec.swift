@@ -274,8 +274,13 @@ enum JPEGCodec: ImageCodec {
             guard let componentIndex = frame.components.firstIndex(where: { $0.identifier == identifier }) else {
                 throw ImageError.invalidData(reason: "JPEG scan references an unknown component")
             }
-            frame.components[componentIndex].dcTableIndex = Int(tables >> 4)
-            frame.components[componentIndex].acTableIndex = Int(tables & 0x0F)
+            let dcTableIndex = Int(tables >> 4)
+            let acTableIndex = Int(tables & 0x0F)
+            guard dcTableIndex < 4, acTableIndex < 4 else {
+                throw ImageError.invalidData(reason: "JPEG scan references a Huffman table slot outside 0...3")
+            }
+            frame.components[componentIndex].dcTableIndex = dcTableIndex
+            frame.components[componentIndex].acTableIndex = acTableIndex
             componentIndices.append(componentIndex)
         }
         let spectralStart = Int(try reader.readByte())
