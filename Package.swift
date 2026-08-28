@@ -45,5 +45,14 @@ let package = Package(
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],
         ),
+        // Randomized robustness testing. Its suites are skipped unless
+        // selected, so the everyday suite stays fast; see the target's README.
+        .testTarget(
+            name: "OmniPixelFuzzTests",
+            dependencies: ["OmniPixel"],
+            swiftSettings: [
+                .enableUpcomingFeature("ApproachableConcurrency"),
+            ],
+        ),
     ]
 )
