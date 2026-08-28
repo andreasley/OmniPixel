@@ -86,7 +86,11 @@ enum PNGCodec: ImageCodec {
         let channels = try channelCount(for: header.colorType)
         var raw = try Inflate.zlibDecompress(
             compressedImageData,
-            expectedSize: expectedRawSize(for: header, channels: channels)
+            expectedSize: expectedRawSize(
+                for: header,
+                channels: channels,
+                compressedCount: compressedImageData.count
+            )
         )
         return try buildImage(
             header: header,
@@ -179,17 +183,26 @@ enum PNGCodec: ImageCodec {
         return (width, height, (width * bitsPerPixel + 7) / 8)
     }
 
-    /// The exact length of the unfiltered stream the header implies, so the
-    /// inflate buffer can be sized once. Capped, so a corrupt header can't turn
-    /// into an enormous allocation — a stream that needs more still grows.
-    private static func expectedRawSize(for header: Header, channels: Int) -> Int {
+    /// The exact length of the unfiltered stream the header implies: a filter
+    /// byte plus a packed row for every row of every pass.
+    private static func rawSize(for header: Header, channels: Int) -> Int {
         let bitsPerPixel = header.bitDepth * channels
         var total = 0
         for pass in passes(for: header) {
             let size = passSize(pass, header: header, bitsPerPixel: bitsPerPixel)
             total += size.height * (size.bytesPerRow + 1)
         }
-        return min(total, 64 << 20)
+        return total
+    }
+
+    /// The same figure as a hint for sizing the inflate buffer once. It is
+    /// capped both absolutely and by what this much compressed data could
+    /// possibly expand to — DEFLATE's best case is a little over 1000:1 — so a
+    /// tiny IDAT claiming huge dimensions cannot reserve megabytes it could
+    /// never fill. A hint that turns out too small merely grows.
+    private static func expectedRawSize(for header: Header, channels: Int, compressedCount: Int) -> Int {
+        let ceiling = min(64 << 20, max(4096, compressedCount * 1032))
+        return min(rawSize(for: header, channels: channels), ceiling)
     }
 
     /// Unfilters the raw stream in place and converts it to pixels. Rows are
@@ -205,6 +218,14 @@ enum PNGCodec: ImageCodec {
         let bitsPerPixel = header.bitDepth * channels
         // Filters operate on bytes; sub-byte depths use a distance of one byte.
         let filterDistance = max(1, bitsPerPixel / 8)
+
+        // The header decides the size of the pixel buffer, which for the largest
+        // image we accept is a gigabyte. Check it against the data we actually
+        // have before allocating any of it, so a few bytes claiming huge
+        // dimensions are rejected rather than honoured.
+        guard raw.count == rawSize(for: header, channels: channels) else {
+            throw ImageError.invalidData(reason: "PNG image data doesn't match its dimensions")
+        }
 
         var pixels = [RGBA](repeating: .transparent, count: header.width * header.height)
         let converter = RowConverter(
