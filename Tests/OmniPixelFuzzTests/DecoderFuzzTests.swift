@@ -19,14 +19,21 @@ struct DecoderFuzzTests {
     /// `mutatedSampleFilesNeverCrash` instead.
     static let encodableFormats: [ImageFormat] = [.png, .jpeg, .gif, .tiff, .webp, .bmp, .qoi, .netpbm]
 
-    @Test("mutated files are rejected, not fatal", arguments: encodableFormats)
-    func mutatedFilesNeverCrash(format: ImageFormat) throws {
-        let seeds = FuzzCorpus.encodedSeeds(for: format)
+    /// Encoded once up front: all shards of a format share these, and
+    /// encoding per test case would repeat the work `shardCount` times over.
+    private static let seedsByFormat: [ImageFormat: [Data]] = Dictionary(
+        uniqueKeysWithValues: encodableFormats.map { ($0, FuzzCorpus.encodedSeeds(for: $0)) }
+    )
+
+    @Test("mutated files are rejected, not fatal",
+          arguments: encodableFormats, 0..<FuzzBudget.shardCount)
+    func mutatedFilesNeverCrash(format: ImageFormat, shard: Int) throws {
+        let seeds = Self.seedsByFormat[format] ?? []
         try #require(!seeds.isEmpty, "no encoder produced a seed file for \(format)")
 
         let oracle = FuzzOracle(label: "\(format) mutation")
         var decoded = 0
-        for iteration in 0..<FuzzBudget.iterations {
+        for iteration in FuzzBudget.indices(shard: shard) {
             let seed = FuzzBudget.seed &+ UInt64(iteration) &* 0x9E37_79B9
             var random = FuzzRandom(seed: seed)
             let original = [UInt8](seeds[random.below(seeds.count)])
@@ -43,15 +50,15 @@ struct DecoderFuzzTests {
         }
         // Not a correctness requirement, but a run where nothing ever decoded
         // would mean the mutations are too destructive to be testing much.
-        // A handful of iterations can legitimately all land on rejects, so
-        // the check only applies to a real budget.
-        if FuzzBudget.iterations >= 500 {
+        // A shard with only a handful of cases can legitimately land on all
+        // rejects, so the check only applies to a real budget.
+        if FuzzBudget.shardsCanExpectDecodes {
             #expect(decoded > 0, "\(format): no mutated file decoded, so little was exercised")
         }
     }
 
-    @Test("mutated sample files are rejected, not fatal")
-    func mutatedSampleFilesNeverCrash() throws {
+    @Test("mutated sample files are rejected, not fatal", arguments: 0..<FuzzBudget.shardCount)
+    func mutatedSampleFilesNeverCrash(shard: Int) throws {
         let samples = FuzzCorpus.sampleFiles
         try #require(!samples.isEmpty, "no sample files found next to the package")
 
@@ -59,7 +66,7 @@ struct DecoderFuzzTests {
         // HEVC decoders, so a case costs orders of magnitude more than a PNG or
         // BMP one. A tenth of the budget keeps a default run to a few seconds.
         let oracle = FuzzOracle(label: "sample mutation")
-        for iteration in 0..<max(100, FuzzBudget.iterations / 10) {
+        for iteration in FuzzBudget.indices(shard: shard, of: max(100, FuzzBudget.iterations / 10)) {
             let seed = FuzzBudget.seed &+ UInt64(iteration) &* 0x8E37_79B1
             var random = FuzzRandom(seed: seed)
             let sample = samples[random.below(samples.count)]
@@ -90,10 +97,10 @@ struct DecoderFuzzTests {
 
     /// Bytes with no valid header at all: the format detector and every
     /// `canDecode` must cope with arbitrary input, including very short input.
-    @Test("arbitrary bytes are rejected, not fatal")
-    func arbitraryBytesNeverCrash() {
+    @Test("arbitrary bytes are rejected, not fatal", arguments: 0..<FuzzBudget.shardCount)
+    func arbitraryBytesNeverCrash(shard: Int) {
         let oracle = FuzzOracle(label: "arbitrary bytes")
-        for iteration in 0..<FuzzBudget.iterations {
+        for iteration in FuzzBudget.indices(shard: shard) {
             let seed = FuzzBudget.seed &+ UInt64(iteration) &* 0x7E37_79A7
             var random = FuzzRandom(seed: seed)
             let count = random.below(512)
@@ -132,11 +139,11 @@ struct PNGStructureFuzzTests {
 
     /// Arbitrary content in the unfiltered stream, including the per-row filter
     /// type bytes, and a stream that is too short or too long for the header.
-    @Test("corrupt row data is rejected, not fatal")
-    func corruptRowDataNeverCrashes() {
+    @Test("corrupt row data is rejected, not fatal", arguments: 0..<FuzzBudget.shardCount)
+    func corruptRowDataNeverCrashes(shard: Int) {
         let oracle = FuzzOracle(label: "PNG row content")
         var decoded = 0
-        for iteration in 0..<FuzzBudget.iterations {
+        for iteration in FuzzBudget.indices(shard: shard) {
             let seed = FuzzBudget.seed &+ UInt64(iteration) &* 0x6E37_7993
             var random = FuzzRandom(seed: seed)
             let layout = Self.randomLayout(using: &random)
@@ -155,18 +162,20 @@ struct PNGStructureFuzzTests {
                 decoded += 1
             }
         }
-        // As above: only a real budget makes a zero decode count suspicious.
-        if FuzzBudget.iterations >= 500 {
+        // As above: only a real per-shard budget makes a zero decode count
+        // suspicious.
+        if FuzzBudget.shardsCanExpectDecodes {
             #expect(decoded > 0, "no case decoded, so the row pipeline was barely exercised")
         }
     }
 
     /// A header that disagrees with the data it describes. This is where the
     /// pass geometry could walk off either the row buffer or the pixel buffer.
-    @Test("header geometry that contradicts the data is rejected, not fatal")
-    func contradictoryGeometryNeverCrashes() {
+    @Test("header geometry that contradicts the data is rejected, not fatal",
+          arguments: 0..<FuzzBudget.shardCount)
+    func contradictoryGeometryNeverCrashes(shard: Int) {
         let oracle = FuzzOracle(label: "PNG geometry")
-        for iteration in 0..<FuzzBudget.iterations {
+        for iteration in FuzzBudget.indices(shard: shard) {
             let seed = FuzzBudget.seed &+ UInt64(iteration) &* 0x5E37_7981
             var random = FuzzRandom(seed: seed)
             // Build the stream for one layout and describe it as another.
@@ -199,12 +208,12 @@ struct PNGStructureFuzzTests {
 
     /// Byte noise inside a well-formed container with the CRCs repaired, so
     /// corruption lands in the zlib stream and the Huffman tables.
-    @Test("corrupt compressed data is rejected, not fatal")
-    func corruptCompressedDataNeverCrashes() throws {
+    @Test("corrupt compressed data is rejected, not fatal", arguments: 0..<FuzzBudget.shardCount)
+    func corruptCompressedDataNeverCrashes(shard: Int) throws {
         try #require(!Self.compressedSeeds.isEmpty, "the encoder produced no seed files")
 
         let oracle = FuzzOracle(label: "PNG deflate stream")
-        for iteration in 0..<FuzzBudget.iterations {
+        for iteration in FuzzBudget.indices(shard: shard) {
             let seed = FuzzBudget.seed &+ UInt64(iteration) &* 0x4E37_7975
             var random = FuzzRandom(seed: seed)
             var bytes = Self.compressedSeeds[random.below(Self.compressedSeeds.count)]

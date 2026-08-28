@@ -36,7 +36,7 @@ plan can also include or exclude them as a group.
 | Variable | Effect |
 | --- | --- |
 | `OMNIPIXEL_FUZZ` | Enables the fuzz suites regardless of how tests were selected. |
-| `OMNIPIXEL_FUZZ_ITERATIONS` | Cases per test (default 5000). |
+| `OMNIPIXEL_FUZZ_ITERATIONS` | Cases per test (default 5000), split across one shard per CPU core. |
 | `OMNIPIXEL_FUZZ_SEED` | Base seed; replays a reported failure exactly. |
 | `OMNIPIXEL_FUZZ_MINUTES` | Time limit per test. Defaults to `max(30, iterations / 100)`, so raising the budget does not fail the run. |
 
@@ -48,7 +48,8 @@ message reports that seed. Setting `OMNIPIXEL_FUZZ_SEED` to it replays the run.
 A crash gives no message, because the process is gone. The same goes for a
 decoder that loops instead of rejecting: the suite time limit will fail the test,
 but it cannot say which case did it. Either way, run the suites sequentially so
-the last test to start is the culprit:
+the last test case to start is the culprit — and since each case is one shard,
+that also narrows the search to every Nth iteration:
 
 ```sh
 OMNIPIXEL_FUZZ=1 swift test --filter Fuzz --no-parallel
@@ -59,6 +60,12 @@ bytes to a file just before each decode is the quickest way to capture the exact
 input.
 
 ## Worth knowing
+
+- Each test splits its iterations into one shard per CPU core, run as parallel
+  test cases — Swift Testing's pool is exactly core-wide, so this saturates the
+  machine without oversubscribing it. The shards stride the same global
+  iteration indices whatever the core count, so the cases a run covers, and
+  what a reported seed means, are identical on every machine.
 
 - Run the suites under AddressSanitizer from time to time. Swift's bounds checks
   do not cover raw pointer arithmetic, and the decoders use plenty of it:

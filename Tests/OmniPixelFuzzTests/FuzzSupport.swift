@@ -74,6 +74,46 @@ enum FuzzBudget {
         return max(30, iterations / 100)
     }()
 
+    /// How many parameterized shards each randomized test splits into.
+    ///
+    /// Swift Testing runs test cases concurrently on a pool as wide as the
+    /// machine, so one shard per core saturates it without oversubscribing —
+    /// a single-threaded loop would leave the machine idle instead. The
+    /// shards stride the same global iteration indices whatever this count
+    /// is, so which cases a run covers, and what a reported seed means, do
+    /// not depend on the machine.
+    ///
+    /// Full width is only worth it in optimized builds. Unoptimized code
+    /// retains and releases the shared static tables — the corpus, the CRC
+    /// table, the codecs' own lookup tables — on every access, and twenty
+    /// threads bouncing those reference counts between caches spend more
+    /// time contending than decoding (measured: barely faster than one
+    /// thread, at 20× the CPU). `OMNIPIXEL_FUZZ_SHARDS` overrides the
+    /// default either way.
+    static let shardCount: Int = {
+        if let text = ProcessInfo.processInfo.environment["OMNIPIXEL_FUZZ_SHARDS"],
+           let parsed = Int(text), parsed > 0 {
+            return parsed
+        }
+        let cores = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        #if DEBUG
+        return min(2, cores)
+        #else
+        return cores
+        #endif
+    }()
+
+    /// The global iteration indices one shard covers, out of `total`.
+    /// Interleaved rather than blocked, so the expensive cases spread evenly
+    /// across the shards.
+    static func indices(shard: Int, of total: Int = iterations) -> StrideTo<Int> {
+        stride(from: shard, to: total, by: shardCount)
+    }
+
+    /// Whether one shard sees enough cases that "nothing decoded at all"
+    /// signals over-destructive mutations rather than chance.
+    static var shardsCanExpectDecodes: Bool { iterations / shardCount >= 500 }
+
     private static func integer(named name: String, default fallback: Int) -> Int {
         guard let text = ProcessInfo.processInfo.environment[name],
               let parsed = Int(text), parsed > 0 else {
