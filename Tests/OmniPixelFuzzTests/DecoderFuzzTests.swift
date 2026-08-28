@@ -43,7 +43,11 @@ struct DecoderFuzzTests {
         }
         // Not a correctness requirement, but a run where nothing ever decoded
         // would mean the mutations are too destructive to be testing much.
-        #expect(decoded > 0, "\(format): no mutated file decoded, so little was exercised")
+        // A handful of iterations can legitimately all land on rejects, so
+        // the check only applies to a real budget.
+        if FuzzBudget.iterations >= 500 {
+            #expect(decoded > 0, "\(format): no mutated file decoded, so little was exercised")
+        }
     }
 
     @Test("mutated sample files are rejected, not fatal")
@@ -68,6 +72,22 @@ struct DecoderFuzzTests {
         }
     }
 
+    /// The first eight bytes of a valid file, one entry per distinct
+    /// signature: from our encoders where the library has one, from the
+    /// sample files for the decode-only formats. Computed once — encoding
+    /// per case would spend the budget on generating inputs rather than
+    /// decoding them.
+    private static let signaturePrefixes: [[UInt8]] = {
+        let encoded = ImageFormat.allCases.compactMap { format -> [UInt8]? in
+            guard let data = try? FuzzCorpus.sampleImage(width: 2, height: 2).encoded(as: format)
+            else { return nil }
+            return Array([UInt8](data).prefix(8))
+        }
+        let sampled = FuzzCorpus.sampleFiles.map { Array($0.data.prefix(8)) }
+        var seen = Set<[UInt8]>()
+        return (encoded + sampled).filter { seen.insert($0).inserted }
+    }()
+
     /// Bytes with no valid header at all: the format detector and every
     /// `canDecode` must cope with arbitrary input, including very short input.
     @Test("arbitrary bytes are rejected, not fatal")
@@ -80,10 +100,8 @@ struct DecoderFuzzTests {
             var bytes = (0..<count).map { _ in random.byte() }
             // Half the cases start with a real signature, so detection succeeds
             // and the bytes reach an actual decoder.
-            if random.chance(oneIn: 2) {
-                let format = ImageFormat.allCases[random.below(ImageFormat.allCases.count)]
-                let encoded = (try? FuzzCorpus.sampleImage(width: 2, height: 2).encoded(as: format)) ?? Data()
-                bytes = Array([UInt8](encoded).prefix(8)) + bytes
+            if random.chance(oneIn: 2), !Self.signaturePrefixes.isEmpty {
+                bytes = Self.signaturePrefixes[random.below(Self.signaturePrefixes.count)] + bytes
             }
             oracle.check(bytes, seed: seed)
         }
@@ -137,7 +155,10 @@ struct PNGStructureFuzzTests {
                 decoded += 1
             }
         }
-        #expect(decoded > 0, "no case decoded, so the row pipeline was barely exercised")
+        // As above: only a real budget makes a zero decode count suspicious.
+        if FuzzBudget.iterations >= 500 {
+            #expect(decoded > 0, "no case decoded, so the row pipeline was barely exercised")
+        }
     }
 
     /// A header that disagrees with the data it describes. This is where the
