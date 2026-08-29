@@ -33,7 +33,9 @@ enum QOICodec: ImageCodec {
         }
 
         var pixels: [RGBA] = []
-        pixels.reserveCapacity(pixelCount)
+        // Bounded reservation: `pixelCount` is a header field and no payload
+        // byte has been read yet. See the note in GIFLZW.decompress.
+        pixels.reserveCapacity(min(pixelCount, 1 << 20))
         var recent = [RGBA](repeating: RGBA(red: 0, green: 0, blue: 0, alpha: 0), count: 64)
         var pixel = RGBA(red: 0, green: 0, blue: 0, alpha: 255)
 
