@@ -628,6 +628,14 @@ final class HEVCPictureDecoder {
         if magnitude > 0, try cabac.decodeBypass() == 1 {
             delta = -magnitude
         }
+        // 7.4.9.14 bounds CuQpDeltaVal to −26...25 for 8-bit video (the only
+        // depth this decoder reconstructs). The Exp-Golomb escape above can
+        // otherwise reach ±8000, and since Swift's % takes the dividend's
+        // sign, a large negative delta makes currentQP negative — which the
+        // levelScale lookup in dequantization then indexes with.
+        guard (-26...25).contains(delta) else {
+            throw ImageError.invalidData(reason: "HEVC delta quantization parameter out of range")
+        }
         currentQP = (predictedQGQP + delta + 52) % 52
         fineTrace?("      qpDelta \(delta) -> \(currentQP) @bit \(cabac.bitPosition)")
     }

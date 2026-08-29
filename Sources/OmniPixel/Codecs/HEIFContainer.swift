@@ -51,7 +51,6 @@ struct HEIFContainer {
         guard let location = itemLocations[itemID] else { return nil }
         var data: [UInt8] = []
         for extent in location.extents {
-            let start = location.baseOffset + extent.offset
             let source: [UInt8]
             switch location.constructionMethod {
             case 0:
@@ -61,17 +60,34 @@ struct HEIFContainer {
             default:
                 throw ImageError.unsupportedFeature(reason: "HEIC item construction method \(location.constructionMethod) is not supported")
             }
+            // Both terms are 64-bit file fields, so the sum overflows before
+            // any range check can see it; likewise `start + length` below.
+            let (start, startOverflowed) =
+                location.baseOffset.addingReportingOverflow(extent.offset)
+            guard !startOverflowed, start >= 0, start <= source.count else {
+                throw ImageError.invalidData(reason: "HEIC item data lies outside the file")
+            }
             // A zero-length single extent means "to the end of the resource".
             let length = extent.length == 0 && location.extents.count == 1
                 ? source.count - start
                 : extent.length
-            guard start >= 0, length >= 0, start + length <= source.count else {
+            guard length >= 0, length <= source.count - start else {
                 throw ImageError.invalidData(reason: "HEIC item data lies outside the file")
+            }
+            // Extents are individually in range but may each name the whole
+            // resource, so the assembled item can be many times the file.
+            guard data.count <= Self.maxItemBytes - length else {
+                throw ImageError.invalidData(reason: "HEIC item data exceeds \(Self.maxItemBytes) bytes")
             }
             data += source[start..<start + length]
         }
         return data
     }
+
+    /// Cap on an assembled item's size. `iloc` permits thousands of extents
+    /// per item and each may cover the entire file, so without a total the
+    /// assembled data can be orders of magnitude larger than the input.
+    static let maxItemBytes = 256 << 20
 
     // MARK: Box parsing
 

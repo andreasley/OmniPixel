@@ -244,6 +244,19 @@ struct HEVCSequenceParameterSet {
         guard sps.log2CTBSize <= 6, sps.log2MaxTransformBlockSize <= 5 else {
             throw ImageError.invalidData(reason: "Invalid HEVC block size configuration")
         }
+        // 7.4.3.2 requires both picture dimensions to be integer multiples of
+        // MinCbSizeY. Without that, the coding quadtree splits down to coding
+        // units that still overhang the picture — the recursion only checks
+        // that a child's origin is inside it — and reconstruction writes
+        // those units past the end of the plane. It also guarantees even
+        // dimensions, which the chroma planes' truncating division assumes.
+        let minCodingBlockSize = 1 << sps.log2MinCodingBlockSize
+        guard sps.width % minCodingBlockSize == 0,
+              sps.height % minCodingBlockSize == 0 else {
+            throw ImageError.invalidData(
+                reason: "HEVC picture dimensions are not a multiple of the minimum coding block size"
+            )
+        }
 
         sps.scalingListEnabled = try reader.readFlag()
         if sps.scalingListEnabled, try reader.readFlag() {

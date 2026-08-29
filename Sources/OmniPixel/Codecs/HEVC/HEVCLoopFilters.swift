@@ -48,32 +48,35 @@ enum HEVCLoopFilters {
         // in intra pictures. Each edge segment belongs to exactly one block
         // (its own left/top edge), so plain lists need no deduplication,
         // and segments within one pass are independent, so order is free.
-        var lumaVertical: [Int] = []
-        var lumaHorizontal: [Int] = []
-        var chromaVertical: [Int] = []
-        var chromaHorizontal: [Int] = []
+        // Stored as coordinate pairs rather than packed into one integer:
+        // a picture taller than 65536 samples is well inside the pixel
+        // budget, and packing aliases y into x's field at that height.
+        var lumaVertical: [(x: Int, y: Int)] = []
+        var lumaHorizontal: [(x: Int, y: Int)] = []
+        var chromaVertical: [(x: Int, y: Int)] = []
+        var chromaHorizontal: [(x: Int, y: Int)] = []
         for block in picture.transformBlocks {
             let size = 1 << block.log2Size
             if block.componentIndex == 0 {
                 if block.x > 0, block.x & 7 == 0 {
                     for y in stride(from: block.y, to: block.y + size, by: 4) {
-                        lumaVertical.append((block.x << 16) | y)
+                        lumaVertical.append((x: block.x, y: y))
                     }
                 }
                 if block.y > 0, block.y & 7 == 0 {
                     for x in stride(from: block.x, to: block.x + size, by: 4) {
-                        lumaHorizontal.append((x << 16) | block.y)
+                        lumaHorizontal.append((x: x, y: block.y))
                     }
                 }
             } else if block.componentIndex == 1 {
                 if block.x > 0, block.x & 7 == 0 {
                     for y in stride(from: block.y, to: block.y + size, by: 4) {
-                        chromaVertical.append((block.x << 16) | y)
+                        chromaVertical.append((x: block.x, y: y))
                     }
                 }
                 if block.y > 0, block.y & 7 == 0 {
                     for x in stride(from: block.x, to: block.x + size, by: 4) {
-                        chromaHorizontal.append((x << 16) | block.y)
+                        chromaHorizontal.append((x: x, y: block.y))
                     }
                 }
             }
@@ -81,8 +84,7 @@ enum HEVCLoopFilters {
 
         // Luma: all vertical edges across the picture first, then all
         // horizontal edges, in 4-line segments.
-        for key in lumaVertical {
-            let x = key >> 16, y = key & 0xFFFF
+        for (x, y) in lumaVertical {
             filterLumaSegment(
                 &planes.luma, width: planes.lumaWidth,
                 x: x, y: y, vertical: true,
@@ -90,8 +92,7 @@ enum HEVCLoopFilters {
                 betaOffset: picture.betaOffset, tcOffset: picture.tcOffset
             )
         }
-        for key in lumaHorizontal {
-            let x = key >> 16, y = key & 0xFFFF
+        for (x, y) in lumaHorizontal {
             filterLumaSegment(
                 &planes.luma, width: planes.lumaWidth,
                 x: x, y: y, vertical: false,
@@ -104,8 +105,7 @@ enum HEVCLoopFilters {
         // marked edge is filtered.
         let chromaWidth = planes.chromaWidth
         func filterChromaPlane(_ plane: inout [UInt8], qpOffset: Int) {
-            for key in chromaVertical {
-                let x = key >> 16, y = key & 0xFFFF
+            for (x, y) in chromaVertical {
                 let qp = (lumaQP(2 * x - 1, 2 * y) + lumaQP(2 * x, 2 * y) + 1) >> 1
                 filterChromaSegment(
                     &plane, width: chromaWidth,
@@ -114,8 +114,7 @@ enum HEVCLoopFilters {
                     tcOffset: picture.tcOffset
                 )
             }
-            for key in chromaHorizontal {
-                let x = key >> 16, y = key & 0xFFFF
+            for (x, y) in chromaHorizontal {
                 let qp = (lumaQP(2 * x, 2 * y - 1) + lumaQP(2 * x, 2 * y) + 1) >> 1
                 filterChromaSegment(
                     &plane, width: chromaWidth,
