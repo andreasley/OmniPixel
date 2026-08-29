@@ -639,6 +639,17 @@ final class AV1TileDecoder {
         } else {
             hasChroma = numPlanes > 1
         }
+        // ss_size_lookup leaves the subsampled size undefined (BLOCK_INVALID,
+        // stored as -1) for a block taller than wide in 4:2:2, and the plane
+        // geometry lookups in planeTxSize, allZeroCtx and the intra
+        // block-copy prediction all index tables with that result. A
+        // conformant stream never codes the combination, so reject it once
+        // here instead of letting each lookup index with the sentinel.
+        if hasChroma, AV1Tables.subsampledSize[blockSize][chromaSubX][chromaSubY] < 0 {
+            throw ImageError.invalidData(
+                reason: "AV1 block size has no chroma equivalent for this subsampling"
+            )
+        }
         availU = isInside(r - 1, c)
         availL = isInside(r, c - 1)
         availUChroma = availU

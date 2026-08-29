@@ -209,6 +209,16 @@ struct AV1FrameHeader {
             let heightBits = 1 + (try reader.readBits(4))
             frameWidth = 1 + (try reader.readBits(widthBits))
             frameHeight = 1 + (try reader.readBits(heightBits))
+            // The sequence header's dimensions are the only ones the caller
+            // size-checked, and the spec requires the frame to fit inside
+            // them (frame_width_minus_1 <= max_frame_width_minus_1). Without
+            // this, a frame header re-reads up to 65536×65536 and every
+            // allocation derived from miCols/miRows follows it.
+            guard frameWidth <= sequence.width, frameHeight <= sequence.height else {
+                throw ImageError.invalidData(
+                    reason: "AV1 frame size exceeds the sequence header's maximum"
+                )
+            }
         } else {
             frameWidth = sequence.width
             frameHeight = sequence.height
@@ -444,6 +454,13 @@ struct AV1FrameHeader {
             var widestTileSb = 0
             var startSb = 0
             while startSb < sbCols {
+                // The uniform branch is bounded by maxLog2TileCols; this one
+                // reads sizes directly, so it needs the spec's MAX_TILE_COLS
+                // enforced explicitly. Each tile carries per-frame decoder
+                // state, so an unbounded count is an unbounded allocation.
+                guard info.miColStarts.count < Self.maxTileColumns else {
+                    throw ImageError.invalidData(reason: "AV1 tile columns exceed \(Self.maxTileColumns)")
+                }
                 info.miColStarts.append(startSb << sbShift)
                 let maxWidth = min(sbCols - startSb, maxTileWidthSb)
                 let sizeSb = 1 + (try reader.readNonSymmetric(maxWidth))
@@ -460,6 +477,9 @@ struct AV1FrameHeader {
             let maxTileHeightSb = max(maxTileAreaSb / max(widestTileSb, 1), 1)
             startSb = 0
             while startSb < sbRows {
+                guard info.miRowStarts.count < Self.maxTileRows else {
+                    throw ImageError.invalidData(reason: "AV1 tile rows exceed \(Self.maxTileRows)")
+                }
                 info.miRowStarts.append(startSb << sbShift)
                 let maxHeight = min(sbRows - startSb, maxTileHeightSb)
                 startSb += 1 + (try reader.readNonSymmetric(maxHeight))
@@ -473,6 +493,10 @@ struct AV1FrameHeader {
         }
         tiles = info
     }
+
+    /// MAX_TILE_COLS / MAX_TILE_ROWS from the spec's level limits.
+    private static let maxTileColumns = 64
+    private static let maxTileRows = 64
 
     /// tile_log2: the smallest k with blkSize << k ≥ target.
     private static func tileLog2(_ blockSize: Int, _ target: Int) -> Int {

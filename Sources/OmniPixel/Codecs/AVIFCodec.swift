@@ -170,25 +170,39 @@ enum AVIFCodec: ImageCodec {
     /// filters (deblocking, CDEF, loop restoration).
     static func decodeFrame(stream: AVIFStream) throws -> AV1FrameBuffer {
         let frame = AV1FrameBuffer(sequence: stream.sequenceHeader, header: stream.frameHeader)
-        let decoders = try decodeTiles(stream: stream, frame: frame)
+        // Keep only the restoration units, not the decoders: reconstruction
+        // has already written its results into `frame` by the time each tile
+        // finishes, and the decoders are the expensive part to retain.
+        var restorationUnits: [AV1TileDecoder.RestorationUnit] = []
+        try forEachDecodedTile(stream: stream, frame: frame) {
+            restorationUnits.append(contentsOf: $0.restorationUnits)
+        }
         AV1LoopFilters.apply(
             frame: frame,
             sequence: stream.sequenceHeader,
             header: stream.frameHeader,
-            restorationUnits: decoders.flatMap(\.restorationUnits)
+            restorationUnits: restorationUnits
         )
         return frame
     }
 
-    /// Decodes the symbol layer of every tile (validating termination) and
-    /// returns the per-tile decoders holding mode info and coefficients.
-    /// With a frame buffer, prediction and reconstruction run inline.
-    static func decodeTiles(stream: AVIFStream, frame: AV1FrameBuffer? = nil) throws -> [AV1TileDecoder] {
+    /// Decodes the symbol layer of every tile (validating termination),
+    /// passing each decoder to `body` as soon as that tile completes. With a
+    /// frame buffer, prediction and reconstruction run inline.
+    ///
+    /// Callers that only need a summary should take it here rather than
+    /// collecting the decoders: each one allocates mode-info arrays sized
+    /// for the whole frame, so retaining them all makes the working set
+    /// scale with tiles × frame area instead of frame area.
+    static func forEachDecodedTile(
+        stream: AVIFStream,
+        frame: AV1FrameBuffer? = nil,
+        _ body: (AV1TileDecoder) throws -> Void
+    ) throws {
         let info = stream.frameHeader.tiles
         guard stream.tileGroup.tiles.count == info.tileCount else {
             throw ImageError.invalidData(reason: "AV1 tile count mismatch")
         }
-        var decoders: [AV1TileDecoder] = []
         for tileIndex in 0..<info.tileCount {
             let decoder = try AV1TileDecoder(
                 tile: stream.tileGroup.tiles[tileIndex],
@@ -199,8 +213,16 @@ enum AVIFCodec: ImageCodec {
                 frame: frame
             )
             try decoder.decode()
-            decoders.append(decoder)
+            try body(decoder)
         }
+    }
+
+    /// Decodes every tile and returns the per-tile decoders holding mode
+    /// info and coefficients. Only for inspecting a small stream's decode
+    /// state; see `forEachDecodedTile` for the memory cost of holding them.
+    static func decodeTiles(stream: AVIFStream, frame: AV1FrameBuffer? = nil) throws -> [AV1TileDecoder] {
+        var decoders: [AV1TileDecoder] = []
+        try forEachDecodedTile(stream: stream, frame: frame) { decoders.append($0) }
         return decoders
     }
 

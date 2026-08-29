@@ -90,6 +90,11 @@ enum AV1LoopFilters {
         let miSize = Int(frame.miSizes[row][col])
         let txSz = Int(frame.loopfilterTxSizes[plane][row >> subY][col >> subX])
         let planeSize = AV1Tables.subsampledSize[miSize][subX][subY]
+        // Unreachable for data that decoded: `decodeBlock` rejects the 4:2:2
+        // block sizes whose subsampled size is undefined. Guarded anyway
+        // because this runs over the whole frame buffer, one step removed
+        // from that check.
+        guard planeSize >= 0 else { return }
         let skip = frame.skips[row][col]
         let isIntra = true  // intra-only frames
         let prevTxSz = Int(frame.loopfilterTxSizes[plane][prevRow >> subY][prevCol >> subX])
@@ -770,10 +775,13 @@ enum AV1LoopFilters {
             }
         } else {
             // Self-guided filter (7.17.2–3)
+            // Per 7.17.3 the two coded coefficients are w0 and w2; w1, the
+            // weight of the unfiltered sample, is what the triple must sum
+            // to 1 << SGRPROJ_PRJ_BITS.
             let set = unit.parameters[0]
             let w0 = unit.parameters[1]
-            let w1Coefficient = unit.parameters[2]
-            let w2 = (1 << 7) - w0 - w1Coefficient  // SGRPROJ_PRJ_BITS
+            let w2 = unit.parameters[2]
+            let w1 = (1 << 7) - w0 - w2  // SGRPROJ_PRJ_BITS
             let r0 = Self.sgrParams[set][0]
             let r1 = Self.sgrParams[set][2]
             let flt0 = r0 != 0 ? boxFilter(
@@ -787,7 +795,7 @@ enum AV1LoopFilters {
             for i in 0..<h {
                 for j in 0..<w {
                     let u = cdefPlanes[plane][(y + i) * stride + (x + j)] << 4  // SGRPROJ_RST_BITS
-                    var v = w1Coefficient * u
+                    var v = w1 * u
                     v += r0 != 0 ? w0 * flt0[i * w + j] : w0 * u
                     v += r1 != 0 ? w2 * flt1[i * w + j] : w2 * u
                     let s = (v + (1 << 10)) >> 11  // RST_BITS + PRJ_BITS

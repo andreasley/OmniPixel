@@ -102,6 +102,15 @@ struct AV1SequenceHeader {
     var enableOrderHint = false
     var orderHintBits = 0
 
+    /// Upper bound on the coded frame area, in luma samples.
+    ///
+    /// Tighter than `Image.maxPixelCount` because a decoded frame costs far
+    /// more than the image it produces: planes hold one `Int` per sample,
+    /// and CDEF and loop restoration each keep a further copy of every plane
+    /// alive while they run. That is roughly 24 bytes per luma sample
+    /// against the finished image's 4. 2^26 samples covers 8192×8192.
+    static let maxFramePixels = 1 << 26
+
     static func parse(_ payload: [UInt8]) throws -> AV1SequenceHeader {
         var reader = HEVCBitReader(payload)
         var header = AV1SequenceHeader()
@@ -140,7 +149,7 @@ struct AV1SequenceHeader {
         header.width = 1 + (try reader.readBits(widthBits))
         header.height = 1 + (try reader.readBits(heightBits))
         let (pixelCount, overflow) = header.width.multipliedReportingOverflow(by: header.height)
-        guard !overflow, pixelCount <= Image.maxPixelCount else {
+        guard !overflow, pixelCount <= Self.maxFramePixels else {
             throw ImageError.invalidData(reason: "Invalid AV1 picture dimensions")
         }
 
