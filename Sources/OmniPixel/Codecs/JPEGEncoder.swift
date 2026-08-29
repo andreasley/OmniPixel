@@ -637,6 +637,10 @@ private struct JPEGBitWriter {
         assert(entry >> 16 > 0, "Symbol missing from Huffman table")
         assert(amplitude >= 0, "Amplitude bits must be non-negative")
         let length = Int(entry >> 16)
+        // The eight bytes of headroom reserved below are exactly enough for
+        // 27 new bits plus seven pending ones. Widening the coefficient
+        // clamp or adding a longer Huffman code would silently overrun it.
+        assert(length + amplitudeLength <= 27, "write drains more than the reserved headroom")
         let amplitudeMask = (UInt64(1) << UInt64(amplitudeLength)) - 1
         accumulator = (accumulator << UInt64(length + amplitudeLength))
             | (UInt64(entry & 0xFFFF) << UInt64(amplitudeLength))
@@ -668,17 +672,25 @@ private struct JPEGBitWriter {
         capacity: Int,
         count: Int
     ) -> (UnsafeMutablePointer<UInt8>, Int) {
-        let newCapacity = capacity * 2
+        let newCapacity = max(capacity * 2, 4096)
         let newBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: newCapacity)
         newBuffer.initialize(repeating: 0, count: newCapacity)
-        newBuffer.update(from: buffer, count: count)
-        buffer.deallocate()
+        // A zero capacity means `finish` already released the buffer, so
+        // there is nothing to copy and nothing to free. Handling it here
+        // rather than in `write` keeps the check off the hot path while
+        // making a write after `finish` allocate afresh instead of freeing
+        // the old pointer a second time.
+        if capacity > 0 {
+            newBuffer.update(from: buffer, count: count)
+            buffer.deallocate()
+        }
         return (newBuffer, newCapacity)
     }
 
     /// Pads the final partial byte with one bits, releases the buffer and
-    /// returns the entropy-coded bytes.
+    /// returns the entropy-coded bytes. Idempotent.
     mutating func finish() -> [UInt8] {
+        guard capacity > 0 else { return [] }
         if bitCount > 0 {
             let padding = 8 - bitCount
             write(

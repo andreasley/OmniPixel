@@ -228,6 +228,16 @@ enum JPEGCodec: ImageCodec {
         return frame
     }
 
+    /// Largest DCT coefficient magnitude accepted from a scan.
+    ///
+    /// The widest value a Huffman magnitude category can describe (category
+    /// 15, i.e. 32767) rather than the ~2040 an 8-bit image really produces,
+    /// so no plausible file is rejected. Its purpose is to keep
+    /// `coefficient × quantizer × idctTable`, accumulated over two 8-tap
+    /// passes, from overflowing `Int` — successive-approximation refinement
+    /// can add roughly another 16000 on top, which the margin absorbs.
+    private static let maxCoefficient = 32767
+
     private static func parseQuantizationTables(_ reader: inout ByteReader, into tables: inout [[Int]?]) throws {
         var remaining = Int(try reader.readUInt16BigEndian()) - 2
         while remaining > 0 {
@@ -239,9 +249,18 @@ enum JPEGCodec: ImageCodec {
             }
             var table = [Int](repeating: 0, count: 64)  // kept in zigzag order, as stored
             for k in 0..<64 {
-                table[k] = precision == 0
+                let value = precision == 0
                     ? Int(try reader.readByte())
                     : Int(try reader.readUInt16BigEndian())
+                // B.2.4.1 restricts quantization values to 1...255 at 8-bit
+                // sample precision, the only precision decoded here. The
+                // bound matters beyond conformance: together with the
+                // coefficient limit it keeps the integer inverse DCT's
+                // accumulator well inside Int.
+                guard (1...255).contains(value) else {
+                    throw ImageError.invalidData(reason: "Invalid JPEG quantization value")
+                }
+                table[k] = value
             }
             tables[index] = table
             remaining -= 1 + 64 * (precision + 1)
@@ -452,8 +471,13 @@ enum JPEGCodec: ImageCodec {
                     throw ImageError.invalidData(reason: "Invalid JPEG DC coefficient size")
                 }
                 frame.components[componentIndex].predictor += extend(try reader.readBits(size), bitCount: size)
-                frame.components[componentIndex].coefficients[base] =
-                    frame.components[componentIndex].predictor << scan.bitPositionLow
+                // The predictor is a running sum across blocks, so nothing
+                // else bounds it; see maxCoefficient.
+                let dc = frame.components[componentIndex].predictor << scan.bitPositionLow
+                guard abs(dc) <= Self.maxCoefficient else {
+                    throw ImageError.invalidData(reason: "JPEG DC coefficient out of range")
+                }
+                frame.components[componentIndex].coefficients[base] = dc
             } else {
                 // DC refinement: one bit per block.
                 if try reader.readBit() == 1 {
@@ -527,7 +551,14 @@ enum JPEGCodec: ImageCodec {
                 guard k <= bandEnd else {
                     throw ImageError.invalidData(reason: "JPEG coefficient index out of range")
                 }
-                coefficients[base + k] = extend(try reader.readBits(size), bitCount: size) << shift
+                let value = extend(try reader.readBits(size), bitCount: size) << shift
+                // A magnitude category of 15 combined with a progressive
+                // scan's point transform (Al up to 13) yields values around
+                // 2^28, which no DCT coefficient of an 8-bit image can be.
+                guard abs(value) <= Self.maxCoefficient else {
+                    throw ImageError.invalidData(reason: "JPEG AC coefficient out of range")
+                }
+                coefficients[base + k] = value
                 k += 1
             }
         }
