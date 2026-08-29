@@ -200,6 +200,15 @@ enum WebPCodec: ImageCodec {
             let metaImage = try decodeEntropyImage(&reader, width: metaWidth, height: metaHeight, allowMeta: false)
             groupIndexes = metaImage.map { Int(($0 >> 8) & 0xFFFF) }
             groupCount = (groupIndexes.max() ?? 0) + 1
+            // The count comes from the largest index in the meta image, not
+            // from a field of its own, so one block naming 0xFFFF demands
+            // 65536 groups — and each group's five prefix codes allocate
+            // decode tables far larger than the handful of bits that
+            // described them. A group is only reachable if some block
+            // selects it, and encoders index them densely from zero.
+            guard groupCount <= metaWidth * metaHeight else {
+                throw ImageError.invalidData(reason: "VP8L prefix code group index out of range")
+            }
         }
 
         let greenAlphabet = 256 + 24 + (cacheBits > 0 ? 1 << cacheBits : 0)
