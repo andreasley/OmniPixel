@@ -173,7 +173,9 @@ enum TIFFCodec: ImageCodec {
         let bytesPerSample = bits / 8
         let rowBytes = width * samplesPerPixel * bytesPerSample
         var raster: [UInt8] = []
-        raster.reserveCapacity(rowBytes * height)
+        // Bounded reservation: the size derives from header fields, ahead of
+        // reading any strip. See the note in GIFLZW.decompress.
+        raster.reserveCapacity(min(rowBytes * height, 1 << 22))
         var rowsRemaining = height
 
         for stripIndex in stripOffsets.indices where rowsRemaining > 0 {
