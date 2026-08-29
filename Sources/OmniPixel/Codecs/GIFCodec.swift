@@ -330,7 +330,11 @@ enum GIFLZW {
         resetTable()
 
         var output: [Int] = []
-        output.reserveCapacity(expectedCount)
+        // Reserve in a bounded step: `expectedCount` comes from the header
+        // and no compressed byte has been validated yet, so a truncated file
+        // must not be able to commit the whole allocation up front. Growth
+        // from here is amortized.
+        output.reserveCapacity(min(expectedCount, 1 << 20))
         var previous: [Int]?
 
         while output.count < expectedCount {
