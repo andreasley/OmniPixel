@@ -24,11 +24,15 @@ struct SVGXMLElement {
 
 /// Parses an XML document into an element tree.
 struct SVGXMLParser {
-    /// Element nesting limit. Parsing (and later traversal) recurses once per
-    /// level, so without a cap a deeply nested document overflows the stack —
-    /// which is a signal, not a catchable Swift error. Far above what real
-    /// documents use; hand-written SVG rarely exceeds a few dozen levels.
-    private static let maxElementDepth = 256
+    /// Element nesting limit. Parsing recurses twice per level (an element
+    /// and its content), so without a cap a deeply nested document overflows
+    /// the stack — which arrives as a signal, not a catchable Swift error.
+    ///
+    /// Chosen to stay safe on a small stack, not just the main thread's: a
+    /// caller may well rasterize from inside a Swift concurrency task, whose
+    /// stack is a fraction of the size. Still several times deeper than real
+    /// artwork, which rarely passes a dozen levels.
+    static let maxElementDepth = 64
 
     private let scalars: [UnicodeScalar]
     private var position = 0

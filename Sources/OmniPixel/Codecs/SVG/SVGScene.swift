@@ -18,8 +18,9 @@ final class SVGSceneBuilder {
     /// Tree-walk depth limit. `use` re-enters the walk at an arbitrary point
     /// in the tree, so the XML nesting limit alone does not bound how deep
     /// this recursion goes; without its own cap it can overflow the stack.
+    /// Sized like `SVGXMLParser.maxElementDepth`, and for the same reason.
     private var renderDepth = 0
-    private static let maxRenderDepth = 256
+    private static let maxRenderDepth = SVGXMLParser.maxElementDepth
     /// Total flattened points the scene may accumulate.
     ///
     /// A `use` may reference a subtree containing further `use` elements, so

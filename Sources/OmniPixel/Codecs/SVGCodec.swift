@@ -43,10 +43,31 @@ enum SVGCodec: ImageCodec {
             throw ImageError.invalidData(reason: "Root element is not <svg>")
         }
 
+        let (pixelWidth, pixelHeight) = try pixelSize(
+            of: root, requestedWidth: width, requestedHeight: height
+        )
+        let commands = SVGSceneBuilder.build(
+            root: root, deviceWidth: pixelWidth, deviceHeight: pixelHeight
+        )
+        var image = Image(width: pixelWidth, height: pixelHeight, fill: .transparent)
+        SVGRasterizer.render(commands, into: &image)
+        return image
+    }
+
+    /// The pixel dimensions to rasterize a document at.
+    ///
+    /// Guarantees `1 <= width`, `1 <= height` and
+    /// `width * height <= Image.maxPixelCount`, whatever the document's
+    /// declared size and aspect ratio.
+    static func pixelSize(
+        of root: SVGXMLElement,
+        requestedWidth: Int?,
+        requestedHeight: Int?
+    ) throws -> (width: Int, height: Int) {
         let intrinsic = intrinsicSize(of: root)
         var deviceWidth: Double
         var deviceHeight: Double
-        switch (width, height) {
+        switch (requestedWidth, requestedHeight) {
         case let (.some(width), .some(height)):
             deviceWidth = Double(width)
             deviceHeight = Double(height)
@@ -84,13 +105,7 @@ enum SVGCodec: ImageCodec {
         if pixelWidth > Image.maxPixelCount / pixelHeight {
             pixelWidth = Image.maxPixelCount / pixelHeight
         }
-
-        let commands = SVGSceneBuilder.build(
-            root: root, deviceWidth: pixelWidth, deviceHeight: pixelHeight
-        )
-        var image = Image(width: pixelWidth, height: pixelHeight, fill: .transparent)
-        SVGRasterizer.render(commands, into: &image)
-        return image
+        return (pixelWidth, pixelHeight)
     }
 
     /// The document's intrinsic pixel size: its width/height attributes
