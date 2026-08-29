@@ -84,13 +84,19 @@ enum PNGCodec: ImageCodec {
         }
 
         let channels = try channelCount(for: header.colorType)
+        // The exact raw size follows from the header, and `buildImage` rejects
+        // anything else, so it doubles as a hard ceiling: a stream that would
+        // expand past it is already invalid and there is no reason to let it
+        // allocate its way there first.
+        let expectedSize = rawSize(for: header, channels: channels)
         var raw = try Inflate.zlibDecompress(
             compressedImageData,
             expectedSize: expectedRawSize(
                 for: header,
                 channels: channels,
                 compressedCount: compressedImageData.count
-            )
+            ),
+            maximumSize: expectedSize
         )
         return try buildImage(
             header: header,
