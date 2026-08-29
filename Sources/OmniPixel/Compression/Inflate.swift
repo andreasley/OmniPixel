@@ -116,23 +116,42 @@ struct HuffmanTable {
 /// directly addressable while it grows. Managing the storage by hand keeps a
 /// literal down to a single store and lets a match move in machine words
 /// instead of a byte at a time.
-private struct InflateWindow {
+///
+/// Non-copyable so the storage has exactly one owner: a copy would leave two
+/// values pointing at the same allocation and the second `deinit` would free
+/// it twice. `deinit` also means a decode that throws part way through still
+/// gives the memory back.
+private struct InflateWindow: ~Copyable {
     private var storage: UnsafeMutablePointer<UInt8>
     private var capacity: Int
     private(set) var count = 0
+    /// Ceiling on the produced size. DEFLATE expands by up to about 1000:1,
+    /// so without one a small input can drive an arbitrarily large window.
+    private let limit: Int
 
-    init(capacityHint: Int) {
-        capacity = max(1024, capacityHint)
+    init(capacityHint: Int, limit: Int) {
+        self.limit = limit
+        capacity = min(max(1024, capacityHint), max(1024, limit))
         storage = .allocate(capacity: capacity)
         storage.initialize(repeating: 0, count: capacity)
     }
 
-    private mutating func reserve(_ additional: Int) {
+    deinit {
+        storage.deallocate()
+    }
+
+    private mutating func reserve(_ additional: Int) throws {
         guard count + additional > capacity else { return }
+        // Only the growth path can exceed the ceiling, so the check costs
+        // nothing on the common path and caps the peak allocation at `limit`.
+        guard count + additional <= limit else {
+            throw ImageError.invalidData(reason: "DEFLATE output exceeds \(limit) bytes")
+        }
         var newCapacity = max(capacity * 2, 1024)
         while newCapacity < count + additional {
             newCapacity *= 2
         }
+        newCapacity = min(newCapacity, limit)
         let newStorage = UnsafeMutablePointer<UInt8>.allocate(capacity: newCapacity)
         newStorage.initialize(repeating: 0, count: newCapacity)
         newStorage.update(from: storage, count: count)
@@ -142,14 +161,14 @@ private struct InflateWindow {
     }
 
     @inline(__always)
-    mutating func append(_ byte: UInt8) {
-        reserve(1)
+    mutating func append(_ byte: UInt8) throws {
+        try reserve(1)
         storage[count] = byte
         count += 1
     }
 
-    mutating func append(_ bytes: [UInt8]) {
-        reserve(bytes.count)
+    mutating func append(_ bytes: [UInt8]) throws {
+        try reserve(bytes.count)
         bytes.withUnsafeBufferPointer { buffer in
             if let base = buffer.baseAddress {
                 (storage + count).update(from: base, count: buffer.count)
@@ -164,9 +183,9 @@ private struct InflateWindow {
     /// `distance` must be between 1 and `count`: the caller checks it against
     /// the stream, and this walks raw memory on the strength of that check.
     @inline(__always)
-    mutating func repeatPrevious(distance: Int, length: Int) {
+    mutating func repeatPrevious(distance: Int, length: Int) throws {
         precondition(distance >= 1 && distance <= count, "back-reference outside the output")
-        reserve(length)
+        try reserve(length)
         let source = storage + (count - distance)
         let destination = storage + count
         count += length
@@ -191,15 +210,6 @@ private struct InflateWindow {
     func bytes() -> [UInt8] {
         [UInt8](UnsafeBufferPointer(start: storage, count: count))
     }
-
-    /// Frees the storage. Idempotent, so the owner can release it from a
-    /// `defer` and a decode that throws part way through still gives it back.
-    mutating func release() {
-        guard capacity > 0 else { return }
-        storage.deallocate()
-        capacity = 0
-        count = 0
-    }
 }
 
 /// DEFLATE decompression (RFC 1951) and its zlib container (RFC 1950), in pure Swift.
@@ -208,7 +218,11 @@ enum Inflate {
     ///
     /// `expectedSize`, when known, only sizes the output buffer up front; a
     /// stream that produces more still decompresses correctly.
-    static func zlibDecompress(_ input: [UInt8], expectedSize: Int = 0) throws -> [UInt8] {
+    static func zlibDecompress(
+        _ input: [UInt8],
+        expectedSize: Int = 0,
+        maximumSize: Int = defaultMaximumOutputSize
+    ) throws -> [UInt8] {
         guard input.count >= 6 else {
             throw ImageError.invalidData(reason: "zlib stream too short")
         }
@@ -224,7 +238,10 @@ enum Inflate {
             throw ImageError.unsupportedFeature(reason: "zlib preset dictionaries are not supported")
         }
 
-        let output = try decompress(input, range: 2..<(input.count - 4), expectedSize: expectedSize)
+        let output = try decompress(
+            input, range: 2..<(input.count - 4),
+            expectedSize: expectedSize, maximumSize: maximumSize
+        )
 
         let storedChecksum = UInt32(input[input.count - 4]) << 24
             | UInt32(input[input.count - 3]) << 16
@@ -237,23 +254,37 @@ enum Inflate {
     }
 
     /// Decompresses raw DEFLATE data.
-    static func decompressRaw(_ input: [UInt8], expectedSize: Int = 0) throws -> [UInt8] {
-        try decompress(input, range: 0..<input.count, expectedSize: expectedSize)
+    static func decompressRaw(
+        _ input: [UInt8],
+        expectedSize: Int = 0,
+        maximumSize: Int = defaultMaximumOutputSize
+    ) throws -> [UInt8] {
+        try decompress(
+            input, range: 0..<input.count,
+            expectedSize: expectedSize, maximumSize: maximumSize
+        )
     }
+
+    /// Ceiling applied when a caller does not know the decompressed size.
+    /// DEFLATE's best case is a little over 1000:1, so a few kilobytes can
+    /// otherwise ask for gigabytes. Callers that know the exact size — PNG
+    /// does, from the header — should pass it instead.
+    static let defaultMaximumOutputSize = 256 << 20
 
     private static func decompress(
         _ input: [UInt8],
         range: Range<Int>,
-        expectedSize: Int
+        expectedSize: Int,
+        maximumSize: Int
     ) throws -> [UInt8] {
         var reader = BitReader(input, range: range)
         // Callers that know the output size pass it. Otherwise guess four bytes
         // out per byte in, capped so a large compressed input can't turn into a
         // far larger speculative allocation; the window grows if the guess is low.
         var output = InflateWindow(
-            capacityHint: expectedSize > 0 ? expectedSize : min(range.count * 4, 8 << 20)
+            capacityHint: expectedSize > 0 ? expectedSize : min(range.count * 4, 8 << 20),
+            limit: maximumSize
         )
-        defer { output.release() }
 
         while true {
             let isFinal = try reader.readBit() == 1
@@ -286,7 +317,7 @@ enum Inflate {
         guard length ^ complement == 0xFFFF else {
             throw ImageError.invalidData(reason: "Corrupt stored block length")
         }
-        output.append(try reader.readAlignedBytes(length))
+        try output.append(try reader.readAlignedBytes(length))
     }
 
     private static func decodeBlock(
@@ -298,7 +329,7 @@ enum Inflate {
         while true {
             let symbol = try literals.decodeSymbol(from: &reader)
             if symbol < 256 {
-                output.append(UInt8(symbol))
+                try output.append(UInt8(symbol))
             } else if symbol == 256 {
                 return
             } else {
@@ -318,7 +349,7 @@ enum Inflate {
                 guard distance >= 1, distance <= output.count else {
                     throw ImageError.invalidData(reason: "DEFLATE back-reference before start of output")
                 }
-                output.repeatPrevious(distance: distance, length: length)
+                try output.repeatPrevious(distance: distance, length: length)
             }
         }
     }
