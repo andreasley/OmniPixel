@@ -74,10 +74,17 @@ struct SVGRasterizer {
         }
         guard !edges.isEmpty else { return }
 
-        let firstRow = max(0, Int(minY.rounded(.down)))
-        let lastRow = min(image.height - 1, Int(maxY.rounded(.up)))
-        let firstColumn = max(0, Int(minX.rounded(.down)))
-        let lastColumn = min(image.width - 1, Int(maxX.rounded(.up)))
+        // Reject shapes that miss the canvas entirely. Written as positive
+        // comparisons so a non-finite bound — or the untouched sentinels,
+        // which survive when every edge had a NaN coordinate — fails the
+        // guard rather than reaching the conversions below.
+        guard maxY >= 0, minY <= Double(image.height),
+              maxX >= 0, minX <= Double(image.width) else { return }
+
+        let firstRow = pixelIndex(minY.rounded(.down), limit: image.height - 1)
+        let lastRow = pixelIndex(maxY.rounded(.up), limit: image.height - 1)
+        let firstColumn = pixelIndex(minX.rounded(.down), limit: image.width - 1)
+        let lastColumn = pixelIndex(maxX.rounded(.up), limit: image.width - 1)
         guard firstRow <= lastRow, firstColumn <= lastColumn else { return }
 
         // Sort by top edge so the active set can be maintained with a cursor.
@@ -144,6 +151,16 @@ struct SVGRasterizer {
         }
     }
 
+    /// Converts a device-space coordinate to a pixel index in `0...limit`.
+    /// The clamping deliberately happens in floating point: `Int(_:)` traps
+    /// on non-finite values and on anything outside `Int`'s range, and a
+    /// document's coordinates can be arbitrarily large.
+    private static func pixelIndex(_ value: Double, limit: Int) -> Int {
+        guard value > 0 else { return 0 }  // also catches NaN
+        guard value < Double(limit) else { return limit }
+        return Int(value)
+    }
+
     /// Adds one span's horizontal coverage (with fractional ends) to the row.
     /// Returns whether anything was added.
     private static func accumulateSpan(
@@ -156,7 +173,10 @@ struct SVGRasterizer {
         guard clampedEnd > clampedStart else { return false }
 
         let startPixel = Int(clampedStart.rounded(.down))
-        let endPixel = Int((clampedEnd - 1e-12).rounded(.down))
+        // The epsilon keeps a span ending exactly on a pixel boundary out of
+        // the next pixel, but for a span narrower than the epsilon it would
+        // otherwise select the pixel before the start.
+        let endPixel = max(startPixel, Int((clampedEnd - 1e-12).rounded(.down)))
 
         if startPixel == endPixel {
             coverage[startPixel - firstColumn] += clampedEnd - clampedStart

@@ -33,6 +33,16 @@ struct SVGPathBuilder {
     private var subpathStart = SVGPoint.zero
     let tolerance: Double
 
+    /// Points this path may still emit.
+    ///
+    /// Curve flattening subdivides until the segments are within tolerance
+    /// or the depth limit is reached, so a curve with far-flung control
+    /// points emits 2^depth points — over sixteen million from a single
+    /// command. Charging each point bounds the geometry and, because
+    /// `flattenCubic` stops once the budget is spent, the subdivision work
+    /// along with it.
+    private var pointBudget = 200_000
+
     init(tolerance: Double = 0.25) {
         self.tolerance = max(1e-4, tolerance)
     }
@@ -40,9 +50,11 @@ struct SVGPathBuilder {
     var currentPoint: SVGPoint { current }
 
     mutating func move(to point: SVGPoint) {
-        path.subpaths.append(SVGFlattenedPath.Subpath(points: [point]))
         current = point
         subpathStart = point
+        guard pointBudget > 0 else { return }
+        pointBudget -= 1
+        path.subpaths.append(SVGFlattenedPath.Subpath(points: [point]))
     }
 
     mutating func line(to point: SVGPoint) {
@@ -69,11 +81,13 @@ struct SVGPathBuilder {
     }
 
     private mutating func appendPoint(_ point: SVGPoint) {
+        defer { current = point }
+        guard pointBudget > 0 else { return }
+        pointBudget -= 1
         if path.subpaths.isEmpty {
             path.subpaths.append(SVGFlattenedPath.Subpath(points: [current]))
         }
         path.subpaths[path.subpaths.count - 1].points.append(point)
-        current = point
     }
 
     // MARK: Curve flattening
@@ -88,7 +102,7 @@ struct SVGPathBuilder {
         let chordLength = max(chord.length, 1e-9)
         let deviation1 = abs(chord.x * (p0.y - p1.y) - chord.y * (p0.x - p1.x)) / chordLength
         let deviation2 = abs(chord.x * (p0.y - p2.y) - chord.y * (p0.x - p2.x)) / chordLength
-        if max(deviation1, deviation2) <= tolerance || depth >= 24 {
+        if max(deviation1, deviation2) <= tolerance || depth >= 24 || pointBudget == 0 {
             return
         }
         // de Casteljau split at t = 0.5.
@@ -379,19 +393,37 @@ struct SVGStroker {
     let miterLimit: Double
     let tolerance: Double
 
+    /// Points the stroke outline may hold.
+    ///
+    /// Round joins and caps emit a whole polygon per vertex, so the outline
+    /// grows as vertices × segments-per-circle, and a document controls both
+    /// factors — via the point list and via the stroke width, which drives
+    /// the segment count. The limit is deliberately well below the fill-side
+    /// budget: a very wide stroke makes every polygon span the whole canvas,
+    /// which keeps them all in the rasterizer's active edge set at once, and
+    /// that cost grows with the number of edges on every scanline.
+    private static let maxOutlinePoints = 24_000
+
+    /// The outline under construction, with its remaining point budget.
+    private struct Outline {
+        var path = SVGFlattenedPath()
+        var remaining = SVGStroker.maxOutlinePoints
+    }
+
     func stroke(_ path: SVGFlattenedPath) -> SVGFlattenedPath {
-        var outline = SVGFlattenedPath()
+        var outline = Outline()
         let halfWidth = max(width, 1e-6) / 2
         for subpath in path.subpaths {
             strokeSubpath(subpath, halfWidth: halfWidth, into: &outline)
         }
-        return outline
+        return outline.path
     }
 
     private func strokeSubpath(
         _ subpath: SVGFlattenedPath.Subpath, halfWidth: Double,
-        into outline: inout SVGFlattenedPath
+        into outline: inout Outline
     ) {
+        guard outline.remaining > 0 else { return }
         // Drop consecutive duplicate points; they produce degenerate normals.
         var points: [SVGPoint] = []
         for point in subpath.points where points.last.map({ ($0 - point).length > 1e-9 }) ?? true {
@@ -452,7 +484,7 @@ struct SVGStroker {
 
     private func appendJoin(
         previous: SVGPoint, vertex: SVGPoint, next: SVGPoint,
-        halfWidth: Double, into outline: inout SVGFlattenedPath
+        halfWidth: Double, into outline: inout Outline
     ) {
         if join == .round {
             appendCircle(center: vertex, radius: halfWidth, into: &outline)
@@ -484,7 +516,7 @@ struct SVGStroker {
 
     private func appendCap(
         at point: SVGPoint, direction: SVGPoint, halfWidth: Double,
-        into outline: inout SVGFlattenedPath
+        into outline: inout Outline
     ) {
         switch cap {
         case .butt:
@@ -499,9 +531,13 @@ struct SVGStroker {
         }
     }
 
-    private func appendCircle(center: SVGPoint, radius: Double, into outline: inout SVGFlattenedPath) {
+    private func appendCircle(center: SVGPoint, radius: Double, into outline: inout Outline) {
+        guard outline.remaining > 0 else { return }  // don't build a polygon that will be refused
         let step = 2 * acos(min(1, max(0, 1 - tolerance / radius)))
-        let segmentCount = max(8, Int(ceil(2 * .pi / max(step, 1e-3))))
+        // A very wide stroke drives the tolerance-derived step towards zero;
+        // cap the count, since no join needs more than a few hundred
+        // segments to look round at any size this library can rasterize.
+        let segmentCount = min(256, max(8, Int(ceil(2 * .pi / max(step, 1e-3)))))
         var points: [SVGPoint] = []
         points.reserveCapacity(segmentCount)
         for index in 0..<segmentCount {
@@ -514,8 +550,13 @@ struct SVGStroker {
 
     /// Appends a closed polygon, flipped if needed so it always winds
     /// positively — the union then works under the nonzero fill rule.
-    private func appendPolygon(_ points: [SVGPoint], into outline: inout SVGFlattenedPath) {
+    private func appendPolygon(_ points: [SVGPoint], into outline: inout Outline) {
         guard points.count >= 3 else { return }
+        guard points.count <= outline.remaining else {
+            outline.remaining = 0  // spent: stop rather than emit a partial join
+            return
+        }
+        outline.remaining -= points.count
         var signedArea = 0.0
         for index in 0..<points.count {
             let current = points[index]
@@ -524,6 +565,6 @@ struct SVGStroker {
         }
         var polygon = points
         if signedArea < 0 { polygon.reverse() }
-        outline.subpaths.append(SVGFlattenedPath.Subpath(points: polygon, isClosed: true))
+        outline.path.subpaths.append(SVGFlattenedPath.Subpath(points: polygon, isClosed: true))
     }
 }

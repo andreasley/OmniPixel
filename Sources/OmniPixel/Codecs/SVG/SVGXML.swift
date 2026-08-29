@@ -24,6 +24,12 @@ struct SVGXMLElement {
 
 /// Parses an XML document into an element tree.
 struct SVGXMLParser {
+    /// Element nesting limit. Parsing (and later traversal) recurses once per
+    /// level, so without a cap a deeply nested document overflows the stack —
+    /// which is a signal, not a catchable Swift error. Far above what real
+    /// documents use; hand-written SVG rarely exceeds a few dozen levels.
+    private static let maxElementDepth = 256
+
     private let scalars: [UnicodeScalar]
     private var position = 0
 
@@ -86,7 +92,7 @@ struct SVGXMLParser {
         // Skip a UTF-8 BOM if present.
         if peek() == "\u{FEFF}" { position += 1 }
         try skipProlog()
-        guard let root = try parseElement() else {
+        guard let root = try parseElement(depth: 0) else {
             throw ImageError.invalidData(reason: "SVG contains no root element")
         }
         return root
@@ -125,11 +131,14 @@ struct SVGXMLParser {
 
     /// Parses one element (with its subtree). Returns nil at a closing tag,
     /// leaving the position on it for the caller to consume.
-    private mutating func parseElement() throws -> SVGXMLElement? {
+    private mutating func parseElement(depth: Int) throws -> SVGXMLElement? {
         guard peek() == "<" else {
             throw ImageError.invalidData(reason: "Expected element in SVG")
         }
         if peek(1) == "/" { return nil }
+        guard depth < Self.maxElementDepth else {
+            throw ImageError.invalidData(reason: "SVG elements are nested more than \(Self.maxElementDepth) levels deep")
+        }
         position += 1  // consume "<"
 
         var element = SVGXMLElement(name: try parseName())
@@ -140,7 +149,7 @@ struct SVGXMLParser {
         guard match(">") else {
             throw ImageError.invalidData(reason: "Malformed SVG tag \(element.name)")
         }
-        try parseContent(into: &element)
+        try parseContent(into: &element, depth: depth)
         return element
     }
 
@@ -194,7 +203,7 @@ struct SVGXMLParser {
     }
 
     /// Parses children and text until the element's closing tag.
-    private mutating func parseContent(into element: inout SVGXMLElement) throws {
+    private mutating func parseContent(into element: inout SVGXMLElement, depth: Int) throws {
         var text = String.UnicodeScalarView()
         while !isAtEnd {
             if peek() == "<" {
@@ -216,7 +225,7 @@ struct SVGXMLParser {
                     }
                     element.text = Self.decodeEntities(String(text))
                     return
-                } else if let child = try parseElement() {
+                } else if let child = try parseElement(depth: depth + 1) {
                     element.children.append(child)
                 }
             } else if let scalar = advance() {

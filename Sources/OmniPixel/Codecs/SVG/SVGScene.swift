@@ -15,6 +15,30 @@ final class SVGSceneBuilder {
     private var commands: [SVGDrawCommand] = []
     private var useDepth = 0
     private static let maxUseDepth = 12
+    /// Tree-walk depth limit. `use` re-enters the walk at an arbitrary point
+    /// in the tree, so the XML nesting limit alone does not bound how deep
+    /// this recursion goes; without its own cap it can overflow the stack.
+    private var renderDepth = 0
+    private static let maxRenderDepth = 256
+    /// Total flattened points the scene may accumulate.
+    ///
+    /// A `use` may reference a subtree containing further `use` elements, so
+    /// expansion is exponential in the nesting depth: `maxUseDepth` bounds
+    /// the depth but not the breadth, and 12 levels of ten references each
+    /// is 10^12 shapes. Charging every emitted point against one budget
+    /// bounds the total work no matter how it is nested.
+    private var pointBudget = 2_000_000
+    /// Node visits the tree walk may make.
+    ///
+    /// Separate from the point budget because visits that emit no geometry
+    /// are free to describe: a `use` chain bottoming out at `maxUseDepth`
+    /// draws nothing, so it spends no points while still exploring
+    /// exponentially many nodes.
+    private var visitBudget = 1_000_000
+    /// Draw commands the scene may hold. The point budget alone leaves room
+    /// for millions of three-point shapes, and each command carries fixed
+    /// per-shape cost in the rasterizer regardless of how small it is.
+    private static let maxCommands = 100_000
 
     /// Inherited graphics state, in the spirit of the CSS cascade.
     private struct GraphicsState {
@@ -131,6 +155,12 @@ final class SVGSceneBuilder {
     // MARK: Tree walking
 
     private func render(_ element: SVGXMLElement, state: GraphicsState) {
+        guard visitBudget > 0, pointBudget > 0,
+              renderDepth < Self.maxRenderDepth else { return }
+        visitBudget -= 1
+        renderDepth += 1
+        defer { renderDepth -= 1 }
+
         var state = state
         // Elements hidden via display/visibility are skipped entirely.
         let styles = styleProperties(of: element)
@@ -254,6 +284,7 @@ final class SVGSceneBuilder {
         if fillIsAllowed, let paint = resolvePaint(
             state.fill, state: state, boundingBox: boundingBox
         ) {
+            guard charge(devicePath) else { return }
             commands.append(SVGDrawCommand(
                 path: devicePath,
                 fillRule: state.fillRule,
@@ -273,7 +304,7 @@ final class SVGSceneBuilder {
                 tolerance: tolerance
             )
             let outline = stroker.stroke(userPath).transformed(by: state.transform)
-            if !outline.isEmpty {
+            if !outline.isEmpty, charge(outline) {
                 commands.append(SVGDrawCommand(
                     path: outline,
                     fillRule: .nonzero,
@@ -282,6 +313,18 @@ final class SVGSceneBuilder {
                 ))
             }
         }
+    }
+
+    /// Charges a path's points against the scene budget. Returns false once
+    /// either budget is spent, which also stops the tree walk in `render`.
+    private func charge(_ path: SVGFlattenedPath) -> Bool {
+        let points = path.subpaths.reduce(0) { $0 + $1.points.count }
+        guard points <= pointBudget, commands.count < Self.maxCommands else {
+            pointBudget = 0
+            return false
+        }
+        pointBudget -= points
+        return true
     }
 
     private static func boundingBox(of path: SVGFlattenedPath)

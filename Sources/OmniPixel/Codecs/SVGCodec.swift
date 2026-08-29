@@ -67,14 +67,23 @@ enum SVGCodec: ImageCodec {
 
         // Scale oversized requests down to the allocation limit,
         // preserving the aspect ratio.
+        let limit = Double(Image.maxPixelCount)
         let pixelCount = deviceWidth * deviceHeight
-        if pixelCount > Double(Image.maxPixelCount) {
-            let shrink = (Double(Image.maxPixelCount) / pixelCount).squareRoot()
+        if pixelCount > limit {
+            let shrink = (limit / pixelCount).squareRoot()
             deviceWidth *= shrink
             deviceHeight *= shrink
         }
-        let pixelWidth = max(1, Int(deviceWidth.rounded()))
-        let pixelHeight = max(1, Int(deviceHeight.rounded()))
+        // Shrinking preserves the aspect ratio, so an extreme one leaves the
+        // long side far above the limit (and possibly above Int.max) once the
+        // short side has been scaled below a whole pixel. Clamp each side
+        // while still in floating point, then trim the product, so neither
+        // the conversion nor the allocation can exceed its bound.
+        var pixelWidth = max(1, Int(min(deviceWidth.rounded(), limit)))
+        let pixelHeight = max(1, Int(min(deviceHeight.rounded(), limit)))
+        if pixelWidth > Image.maxPixelCount / pixelHeight {
+            pixelWidth = Image.maxPixelCount / pixelHeight
+        }
 
         let commands = SVGSceneBuilder.build(
             root: root, deviceWidth: pixelWidth, deviceHeight: pixelHeight
